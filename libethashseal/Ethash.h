@@ -33,10 +33,11 @@ namespace dev
 namespace eth
 {
 
-class Ethash: public SealEngineFace
+class Ethash: public SealEngineBase
 {
 public:
 	Ethash();
+	~Ethash();
 
 	std::string name() const override { return "Ethash"; }
 	unsigned revision() const override { return 1; }
@@ -45,7 +46,7 @@ public:
 
 	StringHashMap jsInfo(BlockHeader const& _bi) const override;
 	void verify(Strictness _s, BlockHeader const& _bi, BlockHeader const& _parent, bytesConstRef _block) const override;
-	void verifyTransaction(ImportRequirements::value _ir, TransactionBase const& _t, BlockHeader const& _bi) const override;
+	void verifyTransaction(ImportRequirements::value _ir, TransactionBase const& _t, BlockHeader const& _header, u256 const& _startGasUsed) const override;
 	void populateFromParent(BlockHeader& _bi, BlockHeader const& _parent) const override;
 
 	strings sealers() const override;
@@ -53,7 +54,6 @@ public:
 	void setSealer(std::string const& _sealer) override { m_sealer = _sealer; }
 	void cancelGeneration() override { m_farm.stop(); }
 	void generateSeal(BlockHeader const& _bi) override;
-	void onSealGenerated(std::function<void(bytes const&)> const& _f) override;
 	bool shouldSeal(Interface* _i) override;
 
 	eth::GenericFarm<EthashProofOfWork>& farm() { return m_farm; }
@@ -69,8 +69,6 @@ public:
 	u256 calculateDifficulty(BlockHeader const& _bi, BlockHeader const& _parent) const;
 	u256 childGasLimit(BlockHeader const& _bi, u256 const& _gasFloorTarget = Invalid256) const;
 
-	virtual EVMSchedule const& evmSchedule(EnvInfo const&) const override;
-
 	void manuallySetWork(BlockHeader const& _work) { m_sealing = _work; }
 	void manuallySubmitWork(h256 const& _mixHash, Nonce _nonce);
 
@@ -84,7 +82,9 @@ private:
 	eth::GenericFarm<EthashProofOfWork> m_farm;
 	std::string m_sealer = "cpu";
 	BlockHeader m_sealing;
-	std::function<void(bytes const&)> m_onSealGenerated;
+
+	/// A mutex covering m_sealing
+	Mutex m_submitLock;
 };
 
 }

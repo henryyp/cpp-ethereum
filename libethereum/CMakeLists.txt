@@ -1,30 +1,6 @@
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSTATICLIB")
+file(GLOB sources "*.cpp" "*.h")
 
-aux_source_directory(. SRC_LIST)
+add_library(ethereum ${sources})
 
-file(GLOB HEADERS "*.h")
-
-add_library(ethereum ${SRC_LIST} ${HEADERS})
-
-target_link_libraries(ethereum ${Boost_REGEX_LIBRARIES} jsoncpp)
-
-find_package(Boost QUIET REQUIRED COMPONENTS regex)
-find_package(Dev)
-find_package(Eth)
-
-target_include_directories(ethereum PRIVATE ..)
 target_include_directories(ethereum PRIVATE ../utils)
-target_link_libraries(ethereum ${Boost_REGEX_LIBRARIES})
-target_link_libraries(ethereum ${Eth_ETHCORE_LIBRARIES})
-target_link_libraries(ethereum ${Eth_EVM_LIBRARIES})
-
-if (NOT EMSCRIPTEN)
-	target_link_libraries(ethereum ${Dev_P2P_LIBRARIES})
-	target_link_libraries(ethereum ${Dev_DEVCRYPTO_LIBRARIES})
-endif()
-
-if (EVMJIT)
-	target_link_libraries(ethereum ${Eth_EVMJIT_LIBRARIES})
-endif()
-
-install(TARGETS ethereum RUNTIME DESTINATION bin ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+target_link_libraries(ethereum PUBLIC evm ethcore p2p devcrypto devcore PRIVATE jsoncpp_lib_static Snappy::snappy)

@@ -27,9 +27,6 @@
 #ifdef __APPLE__
 #include <pthread.h>
 #endif
-#if !defined(ETH_EMSCRIPTEN)
-#include <boost/asio/ip/tcp.hpp>
-#endif
 #include "Guards.h"
 using namespace std;
 using namespace dev;
@@ -110,13 +107,6 @@ LogOutputStreamBase::LogOutputStreamBase(char const* _id, std::type_info const* 
 	}
 }
 
-#if !defined(ETH_EMSCRIPTEN)
-void LogOutputStreamBase::append(boost::asio::ip::basic_endpoint<boost::asio::ip::tcp> const& _t)
-{
-	m_sstr << EthNavyUnder "tcp://" << _t << EthReset;
-}
-#endif
-
 /// Associate a name with each thread for nice logging.
 struct ThreadLocalLogName
 {
@@ -172,11 +162,6 @@ string dev::ThreadContext::join(string const& _prior)
 	return g_logThreadContext.join(_prior);
 }
 
-// foward declare without all of Windows.h
-#if defined(_WIN32)
-extern "C" __declspec(dllimport) void __stdcall OutputDebugStringA(const char* lpOutputString);
-#endif
-
 string dev::getThreadName()
 {
 #if defined(__GLIBC__) || defined(__APPLE__)
@@ -200,20 +185,7 @@ void dev::setThreadName(string const& _n)
 #endif
 }
 
-void dev::simpleDebugOut(std::string const& _s, char const*)
+void dev::debugOut(std::string const& _s)
 {
-	static SpinLock s_lock;
-	SpinGuard l(s_lock);
-
-	cerr << _s << endl << flush;
-
-	// helpful to use OutputDebugString on windows
-	#if defined(_WIN32)
-	{
-		OutputDebugStringA(_s.data());
-		OutputDebugStringA("\n");
-	}
-	#endif
+	cerr << _s << '\n';
 }
-
-std::function<void(std::string const&, char const*)> dev::g_logPost = simpleDebugOut;

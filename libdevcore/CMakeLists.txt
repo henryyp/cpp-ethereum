@@ -1,24 +1,24 @@
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSTATICLIB")
+file(GLOB sources "*.cpp")
+file(GLOB headers "*.h")
 
-aux_source_directory(. SRC_LIST)
+add_library(devcore ${sources} ${headers})
 
-file(GLOB HEADERS "*.h")
+add_dependencies(devcore BuildInfo.h)
 
-add_library(devcore ${SRC_LIST} ${HEADERS})
+# This "local" include path will be propagated to all other libs.
+target_include_directories(devcore PUBLIC ..)
 
-find_package(Boost QUIET REQUIRED COMPONENTS thread filesystem random system)
+# Needed to prevent including system-level boost headers:
+target_include_directories(devcore SYSTEM PUBLIC ${Boost_INCLUDE_DIR} PRIVATE ../utils)
 
-target_include_directories(devcore PRIVATE ..)
-target_include_directories(devcore SYSTEM PUBLIC ${Boost_INCLUDE_DIRS})
-target_link_libraries(devcore ${Boost_FILESYSTEM_LIBRARIES})
-target_link_libraries(devcore ${Boost_RANDOM_LIBRARIES})
-target_link_libraries(devcore ${Boost_SYSTEM_LIBRARIES})
-target_link_libraries(devcore ${Boost_THREAD_LIBRARIES})
+target_link_libraries(devcore Boost::filesystem Boost::system Boost::thread Threads::Threads)
 
-if (NOT EMSCRIPTEN)
+if (ROCKSDB)
+    find_package(RocksDB)
+    target_include_directories(devcore SYSTEM PUBLIC ${ROCKSDB_INCLUDE_DIRS})
+    target_link_libraries(devcore ${ROCKSDB_LIBRARIES})
+else()
     find_package(LevelDB)
     target_include_directories(devcore SYSTEM PUBLIC ${LEVELDB_INCLUDE_DIRS})
     target_link_libraries(devcore ${LEVELDB_LIBRARIES})
 endif()
-
-install(TARGETS devcore RUNTIME DESTINATION bin ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)

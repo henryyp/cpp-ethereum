@@ -20,9 +20,9 @@
  */
 
 #include "ExtVM.h"
-#include <exception>
+#include "LastBlockHashesFace.h"
 #include <boost/thread.hpp>
-#include "Executive.h"
+#include <exception>
 
 using namespace dev;
 using namespace dev::eth;
@@ -33,7 +33,7 @@ namespace // anonymous
 static unsigned const c_depthLimit = 1024;
 
 /// Upper bound of stack space needed by single CALL/CREATE execution. Set experimentally.
-static size_t const c_singleExecutionStackSize = 9 * 1024;
+static size_t const c_singleExecutionStackSize = 14 * 1024;
 
 /// Standard thread stack size.
 static size_t const c_defaultStackSize =
@@ -93,30 +93,77 @@ void go(unsigned _depth, Executive& _e, OnOpFunc const& _onOp)
 } // anonymous namespace
 
 
-bool ExtVM::call(CallParameters& _p)
+std::pair<bool, owning_bytes_ref> ExtVM::call(CallParameters& _p)
 {
-	Executive e(m_s, envInfo(), m_sealEngine, depth + 1);
+	Executive e{m_s, envInfo(), m_sealEngine, depth + 1};
 	if (!e.call(_p, gasPrice, origin))
 	{
 		go(depth, e, _p.onOp);
 		e.accrueSubState(sub);
 	}
 	_p.gas = e.gas();
-
-	return !e.excepted();
+	
+	return {!e.excepted(), e.takeOutput()};
 }
 
-h160 ExtVM::create(u256 _endowment, u256& io_gas, bytesConstRef _code, OnOpFunc const& _onOp)
+size_t ExtVM::codeSizeAt(dev::Address _a)
 {
-	// Increment associated nonce for sender.
-	m_s.noteSending(myAddress);
+	return m_s.codeSize(_a);
+}
 
-	Executive e(m_s, envInfo(), m_sealEngine, depth + 1);
-	if (!e.create(myAddress, _endowment, gasPrice, io_gas, _code, origin))
+void ExtVM::setStore(u256 _n, u256 _v)
+{
+	m_s.setStorage(myAddress, _n, _v);
+}
+
+std::pair<h160, owning_bytes_ref> ExtVM::create(u256 _endowment, u256& io_gas, bytesConstRef _code, Instruction _op, u256 _salt, OnOpFunc const& _onOp)
+{
+	Executive e{m_s, envInfo(), m_sealEngine, depth + 1};
+	bool result = false;
+	if (_op == Instruction::CREATE)
+		result = e.createOpcode(myAddress, _endowment, gasPrice, io_gas, _code, origin);
+	else
+		result = e.create2Opcode(myAddress, _endowment, gasPrice, io_gas, _code, origin, _salt);
+
+	if (!result)
 	{
 		go(depth, e, _onOp);
 		e.accrueSubState(sub);
 	}
 	io_gas = e.gas();
-	return e.newAddress();
+	return {e.newAddress(), e.takeOutput()};
+}
+
+void ExtVM::suicide(Address _a)
+{
+	// TODO: Why transfer is no used here?
+	m_s.addBalance(_a, m_s.balance(myAddress));
+	m_s.subBalance(myAddress, m_s.balance(myAddress));
+	ExtVMFace::suicide(_a);
+}
+
+h256 ExtVM::blockHash(u256 _number)
+{
+	u256 const currentNumber = envInfo().number();
+
+	if (_number >= currentNumber || _number < (std::max<u256>(256, currentNumber) - 256))
+		return h256();
+
+	if (currentNumber < m_sealEngine.chainParams().constantinopleForkBlock + 256)
+	{
+		h256 const parentHash = envInfo().header().parentHash();
+		h256s const lastHashes = envInfo().lastHashes().precedingHashes(parentHash);
+
+		assert(lastHashes.size() > (unsigned)(currentNumber - 1 - _number));
+		return lastHashes[(unsigned)(currentNumber - 1 - _number)];
+	}
+
+	u256 const nonce = m_s.getNonce(caller);
+	u256 const gas = 1000000;
+	Transaction tx(0, 0, gas, c_blockhashContractAddress, toBigEndian(_number), nonce);
+	tx.forceSender(caller);
+
+	ExecutionResult res;
+	std::tie(res, std::ignore) = m_s.execute(envInfo(), m_sealEngine, tx, Permanence::Reverted);
+	return h256(res.output);
 }

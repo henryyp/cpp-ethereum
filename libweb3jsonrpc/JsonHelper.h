@@ -30,7 +30,7 @@
 namespace dev
 {
 
-Json::Value toJson(std::map<u256, u256> const& _storage);
+Json::Value toJson(std::map<h256, std::pair<u256, u256>> const& _storage);
 Json::Value toJson(std::unordered_map<u256, u256> const& _storage);
 Json::Value toJson(Address const& _address);
 
@@ -87,6 +87,11 @@ Message toMessage(Json::Value const& _json);
 Envelope toSealed(Json::Value const& _json, Message const& _m, Secret const& _from);
 std::pair<Topics, Public> toWatch(Json::Value const& _json);
 
+}
+
+namespace rpc
+{
+h256 h256fromHex(std::string const& _s);
 }
 
 template <class T>

@@ -16,7 +16,6 @@
 */
 
 #include "SmartVM.h"
-#include <unordered_map>
 #include <thread>
 #include <libdevcore/concurrent_queue.h>
 #include <libdevcore/Log.h>
@@ -44,7 +43,8 @@ namespace
 	{
 		bytes code;
 		h256 codeHash;
-		evm_mode mode;
+		evm_revision mode;
+		uint32_t flags;
 
 		static JitTask createStopSentinel() { return JitTask(); }
 
@@ -67,7 +67,7 @@ namespace
 			while (!(task = m_queue.pop()).isStopSentinel())
 			{
 				clog(JitInfo) << "Compilation... " << task.codeHash;
-				JitVM::compile(task.mode, {task.code.data(), task.code.size()}, task.codeHash);
+				JitVM::compile(task.mode, task.flags, {task.code.data(), task.code.size()}, task.codeHash);
 				clog(JitInfo) << "   ...finished " << task.codeHash;
 			}
 			clog(JitInfo) << "JIT worker finished.";
@@ -87,12 +87,13 @@ namespace
 	};
 }
 
-bytesConstRef SmartVM::execImpl(u256& io_gas, ExtVMFace& _ext, OnOpFunc const& _onOp)
+owning_bytes_ref SmartVM::exec(u256& io_gas, ExtVMFace& _ext, OnOpFunc const& _onOp)
 {
 	auto vmKind = VMKind::Interpreter; // default VM
+	auto mode = JitVM::toRevision(_ext.evmSchedule());
+	uint32_t flags = _ext.staticCall ? EVM_STATIC : 0;
 	// Jitted EVM code already in memory?
-	auto mode = _ext.evmSchedule().haveDelegateCall ? EVM_HOMESTEAD : EVM_FRONTIER;
-	if (JitVM::isCodeReady(mode, _ext.codeHash))
+	if (JitVM::isCodeReady(mode, flags, _ext.codeHash))
 	{
 		clog(JitInfo) << "JIT:           " << _ext.codeHash;
 		vmKind = VMKind::JIT;
@@ -108,15 +109,12 @@ bytesConstRef SmartVM::execImpl(u256& io_gas, ExtVMFace& _ext, OnOpFunc const& _
 		if (hits == c_hitTreshold)
 		{
 			clog(JitInfo) << "Schedule:      " << _ext.codeHash;
-			s_worker.push({_ext.code, _ext.codeHash, mode});
+			s_worker.push({_ext.code, _ext.codeHash, mode, flags});
 		}
 		clog(JitInfo) << "Interpreter:   " << _ext.codeHash;
 	}
 
-	// TODO: Selected VM must be kept only because it returns reference to its internal memory.
-	//       VM implementations should be stateless, without escaping memory reference.
-	m_selectedVM = VMFactory::create(vmKind);
-	return m_selectedVM->execImpl(io_gas, _ext, _onOp);
+	return VMFactory::create(vmKind)->exec(io_gas, _ext, _onOp);
 }
 
 }

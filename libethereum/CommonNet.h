@@ -57,7 +57,7 @@ class TransactionQueue;
 class EthereumHost;
 class EthereumPeer;
 
-enum: byte
+enum SubprotocolPacketType: byte
 {
 	StatusPacket = 0x00,
 	NewBlockHashesPacket = 0x01,
@@ -90,11 +90,9 @@ enum class SyncState
 {
 	NotSynced,			///< Initial chain sync has not started yet
 	Idle,				///< Initial chain sync complete. Waiting for new packets
-	//Seeking,            ///< Gettting subchain headers
 	Waiting,			///< Block downloading paused. Waiting for block queue to process blocks and free space
 	Blocks,				///< Downloading blocks
 	State,				///< Downloading state
-	NewBlocks,			///< Downloading blocks learned from NewHashes packet
 
 	Size		/// Must be kept last
 };
@@ -106,8 +104,6 @@ struct SyncStatus
 	unsigned startBlockNumber;
 	unsigned currentBlockNumber;
 	unsigned highestBlockNumber;
-	unsigned blocksTotal = 0;
-	unsigned blocksReceived = 0;
 	bool majorSyncing = false;
 };
 

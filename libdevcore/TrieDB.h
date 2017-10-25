@@ -22,23 +22,22 @@
 #pragma once
 
 #include <memory>
-#include "db.h"
-#include "Common.h"
 #include "Log.h"
 #include "Exceptions.h"
 #include "SHA3.h"
-#include "MemoryDB.h"
 #include "TrieCommon.h"
 
 namespace dev
 {
 
-struct TrieDBChannel: public LogChannel  { static const char* name(); static const int verbosity = 17; };
+struct TrieDBChannel: public LogChannel
+{
+	static const char* name() { return "-T-"; }
+	static const int verbosity = 17;
+};
 #define tdebug clog(TrieDBChannel)
 
 struct InvalidTrie: virtual dev::Exception {};
-extern const h256 c_shaNull;
-extern const h256 EmptyTrie;
 
 enum class Verification {
 	Skip,
@@ -80,7 +79,7 @@ public:
 		m_root = _root;
 		if (_v == Verification::Normal)
 		{
-			if (m_root == c_shaNull && !m_db->exists(m_root))
+			if (m_root == EmptyTrie && !m_db->exists(m_root))
 				init();
 		}
 		/*std::cout << "Setting root to " << _root << " (patched to " << m_root << ")" << std::endl;*/
@@ -94,7 +93,7 @@ public:
 	/// True if the trie is uninitialised (i.e. that the DB doesn't contain the root node).
 	bool isNull() const { return !node(m_root).size(); }
 	/// True if the trie is initialised but empty (i.e. that the DB contains the root node which is empty).
-	bool isEmpty() const { return m_root == c_shaNull && node(m_root).size(); }
+	bool isEmpty() const { return m_root == EmptyTrie && node(m_root).size(); }
 
 	h256 const& root() const { if (node(m_root).empty()) BOOST_THROW_EXCEPTION(BadRoot(m_root)); /*std::cout << "Returning root as " << ret << " (really " << m_root << ")" << std::endl;*/ return m_root; }	// patch the root in the case of the empty trie. TODO: handle this properly.
 
@@ -106,8 +105,8 @@ public:
 	void insert(bytesConstRef _key, bytesConstRef _value);
 	void remove(bytes const& _key) { remove(&_key); }
 	void remove(bytesConstRef _key);
-	bool contains(bytes const& _key) { return contains(&_key); }
-	bool contains(bytesConstRef _key) { return !at(_key).empty(); }
+	bool contains(bytes const& _key) const { return contains(&_key); }
+	bool contains(bytesConstRef _key) const { return !at(_key).empty(); }
 
 	class iterator
 	{
@@ -162,7 +161,7 @@ public:
 	void descendKey(h256 const& _k, h256Hash& _keyMask, bool _wasExt, std::ostream* _out, int _indent = 0) const
 	{
 		_keyMask.erase(_k);
-		if (_k == m_root && _k == c_shaNull)	// root allowed to be empty
+		if (_k == m_root && _k == EmptyTrie)	// root allowed to be empty
 			return;
 		descendList(RLP(node(_k)), _keyMask, _wasExt, _out, _indent);	// if not, it must be a list
 	}
@@ -391,7 +390,7 @@ public:
 	using Super::debugStructure;
 
 	std::string at(bytesConstRef _key) const { return Super::at(sha3(_key)); }
-	bool contains(bytesConstRef _key) { return Super::contains(sha3(_key)); }
+	bool contains(bytesConstRef _key) const { return Super::contains(sha3(_key)); }
 	void insert(bytesConstRef _key, bytesConstRef _value) { Super::insert(sha3(_key), _value); }
 	void remove(bytesConstRef _key) { Super::remove(sha3(_key)); }
 
@@ -442,7 +441,7 @@ public:
 	using Super::debugStructure;
 
 	std::string at(bytesConstRef _key) const { return Super::at(sha3(_key)); }
-	bool contains(bytesConstRef _key) { return Super::contains(sha3(_key)); }
+	bool contains(bytesConstRef _key) const { return Super::contains(sha3(_key)); }
 	void insert(bytesConstRef _key, bytesConstRef _value)
 	{
 		h256 hash = sha3(_key);
@@ -452,15 +451,14 @@ public:
 
 	void remove(bytesConstRef _key) { Super::remove(sha3(_key)); }
 
-	//friend class iterator;
-
-	class iterator : public GenericTrieDB<_DB>::iterator
+	// iterates over <key, value> pairs
+	class iterator: public GenericTrieDB<_DB>::iterator
 	{
 	public:
 		using Super = typename GenericTrieDB<_DB>::iterator;
 
 		iterator() { }
-		iterator(FatGenericTrieDB const* _trie): Super(_trie) { }
+		iterator(FatGenericTrieDB const* _trie) : Super(_trie) { }
 
 		typename Super::value_type at() const
 		{
@@ -472,8 +470,28 @@ public:
 	private:
 		mutable bytes m_key;
 	};
+
 	iterator begin() const { return iterator(); }
 	iterator end() const { return iterator(); }
+
+	// iterates over <hashedKey, value> pairs
+	class HashedIterator: public GenericTrieDB<_DB>::iterator
+	{
+	public:
+		using Super = typename GenericTrieDB<_DB>::iterator;
+
+		HashedIterator() {}
+		HashedIterator(FatGenericTrieDB const* _trie) : Super(_trie) {}
+
+		bytes key() const
+		{
+			auto hashed = Super::at();
+			return static_cast<FatGenericTrieDB const*>(Super::m_that)->db()->lookupAux(h256(hashed.first));
+		}
+	};
+
+	HashedIterator hashedBegin() const { return HashedIterator(this); }
+	HashedIterator hashedEnd() const { return HashedIterator(); }
 };
 
 template <class KeyType, class DB> using TrieDB = SpecificTrieDB<GenericTrieDB<DB>, KeyType>;
@@ -894,10 +912,6 @@ template <class DB> bytes GenericTrieDB<DB>::mergeAt(RLP const& _orig, h256 cons
 
 template <class DB> void GenericTrieDB<DB>::mergeAtAux(RLPStream& _out, RLP const& _orig, NibbleSlice _k, bytesConstRef _v)
 {
-#if ETH_PARANOIA || !ETH_TRUE
-	tdebug << "mergeAtAux " << _orig << _k << sha3(_orig.data()) << ((_orig.isData() && _orig.size() <= 32) ? _orig.toHash<h256>().abridged() : std::string());
-#endif
-
 	RLP r = _orig;
 	std::string s;
 	// _orig is always a segment of a node's RLP - removing it alone is pointless. However, if may be a hash, in which case we deref and we know it is removable.
@@ -1049,9 +1063,6 @@ template <class DB> bytes GenericTrieDB<DB>::deleteAt(RLP const& _orig, NibbleSl
 
 template <class DB> bool GenericTrieDB<DB>::deleteAtAux(RLPStream& _out, RLP const& _orig, NibbleSlice _k)
 {
-#if ETH_PARANOIA || !ETH_TRUE
-	tdebug << "deleteAtAux " << _orig << _k << sha3(_orig.data()) << ((_orig.isData() && _orig.size() <= 32) ? _orig.toHash<h256>().abridged() : std::string());
-#endif
 
 	bytes b = _orig.isEmpty() ? bytes() : deleteAt(_orig.isList() ? _orig : RLP(node(_orig.toHash<h256>())), _k);
 

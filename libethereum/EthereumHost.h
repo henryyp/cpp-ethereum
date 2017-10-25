@@ -34,6 +34,8 @@
 #include <libethcore/Common.h>
 #include <libp2p/Common.h>
 #include <libdevcore/OverlayDB.h>
+#include <libethcore/BlockHeader.h>
+#include <libethereum/BlockChainSync.h>
 #include "CommonNet.h"
 #include "EthereumPeer.h"
 
@@ -70,12 +72,15 @@ public:
 	void setNetworkId(u256 _n) { m_networkId = _n; }
 
 	void reset();
+	/// Don't sync further - used only in test mode
+	void completeSync();
 
 	bool isSyncing() const;
 	bool isBanned(p2p::NodeID const& _id) const { return !!m_banned.count(_id); }
 
 	void noteNewTransactions() { m_newTransactions = true; }
 	void noteNewBlocks() { m_newBlocks = true; }
+	void onBlockImported(BlockHeader const& _info) { m_sync->onBlockImported(_info); }
 
 	BlockChain const& chain() const { return m_chain; }
 	OverlayDB const& db() const { return m_db; }
@@ -88,18 +93,13 @@ public:
 	static unsigned const c_oldProtocolVersion;
 	void foreachPeer(std::function<bool(std::shared_ptr<EthereumPeer>)> const& _f) const;
 
-	void onPeerStatus(std::shared_ptr<EthereumPeer> _peer);
-	void onPeerBlockHeaders(std::shared_ptr<EthereumPeer> _peer, RLP const& _headers);
-	void onPeerBlockBodies(std::shared_ptr<EthereumPeer> _peer, RLP const& _r);
-	void onPeerNewHashes(std::shared_ptr<EthereumPeer> _peer, std::vector<std::pair<h256, u256>> const& _hashes);
-	void onPeerNewBlock(std::shared_ptr<EthereumPeer> _peer, RLP const& _r);
-	void onPeerTransactions(std::shared_ptr<EthereumPeer> _peer, RLP const& _r);
-	void onPeerAborting();
+protected:
+	std::shared_ptr<p2p::Capability> newPeerCapability(std::shared_ptr<p2p::SessionFace> const& _s, unsigned _idOffset, p2p::CapDesc const& _cap) override;
 
 private:
 	static char const* const s_stateNames[static_cast<int>(SyncState::Size)];
 
-	std::tuple<std::vector<std::shared_ptr<EthereumPeer>>, std::vector<std::shared_ptr<EthereumPeer>>, std::vector<std::shared_ptr<p2p::Session>>> randomSelection(unsigned _percent = 25, std::function<bool(EthereumPeer*)> const& _allow = [](EthereumPeer const*){ return true; });
+	std::tuple<std::vector<std::shared_ptr<EthereumPeer>>, std::vector<std::shared_ptr<EthereumPeer>>, std::vector<std::shared_ptr<p2p::SessionFace>>> randomSelection(unsigned _percent = 25, std::function<bool(EthereumPeer*)> const& _allow = [](EthereumPeer const*){ return true; });
 
 	/// Sync with the BlockChain. It might contain one of our mined blocks, we might have new candidates from the network.
 	virtual void doWork() override;
@@ -117,8 +117,6 @@ private:
 	virtual void onStarting() override { startWorking(); }
 	virtual void onStopping() override { stopWorking(); }
 
-	BlockChainSync* sync();
-
 	BlockChain const& m_chain;
 	OverlayDB const& m_db;					///< References to DB, needed for some of the Ethereum Protocol responses.
 	TransactionQueue& m_tq;					///< Maintains a list of incoming transactions not yet in a block on the blockchain.
@@ -134,11 +132,12 @@ private:
 	bool m_newTransactions = false;
 	bool m_newBlocks = false;
 
-	mutable RecursiveMutex x_sync;
 	mutable Mutex x_transactions;
 	std::unique_ptr<BlockChainSync> m_sync;
-	std::atomic<time_t> m_syncStart = { 0 };
 	std::atomic<time_t> m_lastTick = { 0 };
+
+	std::shared_ptr<EthereumHostDataFace> m_hostData;
+	std::shared_ptr<EthereumPeerObserverFace> m_peerObserver;
 };
 
 }

@@ -1,25 +1,7 @@
-aux_source_directory(. SRC_LIST)
+add_executable(ethvm main.cpp)
 
-add_executable(ethvm ${SRC_LIST})
+target_link_libraries(ethvm PRIVATE ethereum evm ethashseal devcore)
 
-find_package(Eth)
+target_include_directories(ethvm PRIVATE ../utils)
 
-target_include_directories(ethvm PRIVATE ..)
-target_link_libraries(ethvm ${Eth_ETHASH_LIBRARIES})
-target_link_libraries(ethvm ${Eth_ETHASHSEAL_LIBRARIES})
-
-if (MSVC)
-	find_package(Boost QUIET REQUIRED COMPONENTS chrono date_time)
-	target_link_libraries(ethvm ${Boost_CHRONO_LIBRARIES})
-	target_link_libraries(ethvm ${Boost_DATE_TIME_LIBRARIES})
-endif()
-
-if (UNIX AND NOT APPLE)
-	target_link_libraries(ethvm pthread)
-endif()
-
-if (APPLE)
-	install(TARGETS ethvm DESTINATION bin)
-else()
-	eth_install_executable(ethvm)
-endif()
+install(TARGETS ethvm DESTINATION bin OPTIONAL)

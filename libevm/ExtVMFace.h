@@ -14,113 +14,75 @@
 	You should have received a copy of the GNU General Public License
 	along with cpp-ethereum.  If not, see <http://www.gnu.org/licenses/>.
 */
-/** @file ExtVMFace.h
- * @author Gav Wood <i@gavwood.com>
- * @date 2014
- */
 
 #pragma once
 
-#include <set>
-#include <functional>
-#include <libdevcore/Common.h>
-#include <libdevcore/CommonData.h>
-#include <libdevcore/RLP.h>
-#include <libdevcore/SHA3.h>
-#include <libevmcore/Instruction.h>
-#include <libethcore/Common.h>
+#include "Instruction.h"
+
 #include <libethcore/BlockHeader.h>
 #include <libethcore/ChainOperationParams.h>
+#include <libethcore/Common.h>
+#include <libethcore/LogEntry.h>
+#include <libdevcore/Common.h>
+#include <libdevcore/CommonData.h>
+#include <libdevcore/SHA3.h>
+
+#include <evm.h>
+#include <boost/optional.hpp>
+#include <functional>
+#include <set>
 
 namespace dev
 {
 namespace eth
 {
 
-enum class BlockPolarity
+/// Reference to a slice of buffer that also owns the buffer.
+///
+/// This is extension to the concept C++ STL library names as array_view
+/// (also known as gsl::span, array_ref, here vector_ref) -- reference to
+/// continuous non-modifiable memory. The extension makes the object also owning
+/// the referenced buffer.
+///
+/// This type is used by VMs to return output coming from RETURN instruction.
+/// To avoid memory copy, a VM returns its whole memory + the information what
+/// part of this memory is actually the output. This simplifies the VM design,
+/// because there are multiple options how the output will be used (can be
+/// ignored, part of it copied, or all of it copied). The decision what to do
+/// with it was moved out of VM interface making VMs "stateless".
+///
+/// The type is movable, but not copyable. Default constructor available.
+class owning_bytes_ref: public vector_ref<byte const>
 {
-	Unknown,
-	Dead,
-	Live
-};
+public:
+	owning_bytes_ref() = default;
 
-struct LogEntry
-{
-	LogEntry() {}
-	LogEntry(RLP const& _r) { address = (Address)_r[0]; topics = _r[1].toVector<h256>(); data = _r[2].toBytes(); }
-	LogEntry(Address const& _address, h256s const& _ts, bytes&& _d): address(_address), topics(_ts), data(std::move(_d)) {}
-
-	void streamRLP(RLPStream& _s) const { _s.appendList(3) << address << topics << data; }
-
-	LogBloom bloom() const
+	/// @param _bytes  The buffer.
+	/// @param _begin  The index of the first referenced byte.
+	/// @param _size   The number of referenced bytes.
+	owning_bytes_ref(bytes&& _bytes, size_t _begin, size_t _size):
+			m_bytes(std::move(_bytes))
 	{
-		LogBloom ret;
-		ret.shiftBloom<3>(sha3(address.ref()));
-		for (auto t: topics)
-			ret.shiftBloom<3>(sha3(t.ref()));
-		return ret;
+		// Set the reference *after* the buffer is moved to avoid
+		// pointer invalidation.
+		retarget(&m_bytes[_begin], _size);
 	}
 
-	Address address;
-	h256s topics;
-	bytes data;
+	owning_bytes_ref(owning_bytes_ref const&) = delete;
+	owning_bytes_ref(owning_bytes_ref&&) = default;
+	owning_bytes_ref& operator=(owning_bytes_ref const&) = delete;
+	owning_bytes_ref& operator=(owning_bytes_ref&&) = default;
+
+	/// Moves the bytes vector out of here. The object cannot be used any more.
+	bytes&& takeBytes()
+	{
+		reset();  // Reset reference just in case.
+		return std::move(m_bytes);
+	}
+
+private:
+	bytes m_bytes;
 };
-
-using LogEntries = std::vector<LogEntry>;
-
-struct LocalisedLogEntry: public LogEntry
-{
-	LocalisedLogEntry() {}
-	explicit LocalisedLogEntry(LogEntry const& _le): LogEntry(_le) {}
-
-	explicit LocalisedLogEntry(
-		LogEntry const& _le,
-		h256 _special
-	):
-		LogEntry(_le),
-		isSpecial(true),
-		special(_special)
-	{}
-
-	explicit LocalisedLogEntry(
-		LogEntry const& _le,
-		h256 const& _blockHash,
-		BlockNumber _blockNumber,
-		h256 const& _transactionHash,
-		unsigned _transactionIndex,
-		unsigned _logIndex,
-		BlockPolarity _polarity = BlockPolarity::Unknown
-	):
-		LogEntry(_le),
-		blockHash(_blockHash),
-		blockNumber(_blockNumber),
-		transactionHash(_transactionHash),
-		transactionIndex(_transactionIndex),
-		logIndex(_logIndex),
-		polarity(_polarity),
-		mined(true)
-	{}
-
-	h256 blockHash;
-	BlockNumber blockNumber = 0;
-	h256 transactionHash;
-	unsigned transactionIndex = 0;
-	unsigned logIndex = 0;
-	BlockPolarity polarity = BlockPolarity::Unknown;
-	bool mined = false;
-	bool isSpecial = false;
-	h256 special;
-};
-
-using LocalisedLogEntries = std::vector<LocalisedLogEntry>;
-
-inline LogBloom bloom(LogEntries const& _logs)
-{
-	LogBloom ret;
-	for (auto const& l: _logs)
-		ret |= l.bloom();
-	return ret;
-}
 
 struct SubState
 {
@@ -145,14 +107,25 @@ struct SubState
 };
 
 class ExtVMFace;
+class LastBlockHashesFace;
 class VM;
-
-using LastHashes = std::vector<h256>;
 
 using OnOpFunc = std::function<void(uint64_t /*steps*/, uint64_t /* PC */, Instruction /*instr*/, bigint /*newMemSize*/, bigint /*gasCost*/, bigint /*gas*/, VM*, ExtVMFace const*)>;
 
 struct CallParameters
 {
+	CallParameters() = default;
+	CallParameters(
+		Address _senderAddress,
+		Address _codeAddress,
+		Address _receiveAddress,
+		u256 _valueTransfer,
+		u256 _apparentValue,
+		u256 _gas,
+		bytesConstRef _data,
+		OnOpFunc _onOpFunc
+	):	senderAddress(_senderAddress), codeAddress(_codeAddress), receiveAddress(_receiveAddress),
+		valueTransfer(_valueTransfer), apparentValue(_apparentValue), gas(_gas), data(_data), onOp(_onOpFunc)  {}
 	Address senderAddress;
 	Address codeAddress;
 	Address receiveAddress;
@@ -160,83 +133,57 @@ struct CallParameters
 	u256 apparentValue;
 	u256 gas;
 	bytesConstRef data;
-	bytesRef out;
+	bool staticCall = false;
 	OnOpFunc onOp;
 };
 
 class EnvInfo
 {
 public:
-	EnvInfo() {}
-	EnvInfo(BlockHeader const& _current, LastHashes const& _lh = LastHashes(), u256 const& _gasUsed = u256()):
-		m_number(_current.number()),
-		m_author(_current.author()),
-		m_timestamp(_current.timestamp()),
-		m_difficulty(_current.difficulty()),
-		// Trim gas limit to int64. convert_to used explicitly instead of
-		// static_cast to be noticed when BlockHeader::gasLimit() will be
-		// changed to int64 too.
-		m_gasLimit(_current.gasLimit().convert_to<int64_t>()),
+	EnvInfo(BlockHeader const& _current, LastBlockHashesFace const& _lh, u256 const& _gasUsed):
+		m_headerInfo(_current),
 		m_lastHashes(_lh),
 		m_gasUsed(_gasUsed)
 	{}
+	// Constructor with custom gasLimit - used in some synthetic scenarios like eth_estimateGas	RPC method
+	EnvInfo(BlockHeader const& _current, LastBlockHashesFace const& _lh, u256 const& _gasUsed, u256 const& _gasLimit):
+		EnvInfo(_current, _lh, _gasUsed)
+	{
+		m_headerInfo.setGasLimit(_gasLimit);
+	}
 
-	EnvInfo(BlockHeader const& _current, LastHashes&& _lh, u256 const& _gasUsed = u256()):
-		m_number(_current.number()),
-		m_author(_current.author()),
-		m_timestamp(_current.timestamp()),
-		m_difficulty(_current.difficulty()),
-		// Trim gas limit to int64. convert_to used explicitly instead of
-		// static_cast to be noticed when BlockHeader::gasLimit() will be
-		// changed to int64 too.
-		m_gasLimit(_current.gasLimit().convert_to<int64_t>()),
-		m_lastHashes(_lh),
-		m_gasUsed(_gasUsed)
-	{}
+	BlockHeader const& header() const { return m_headerInfo;  }
 
-	u256 const& number() const { return m_number; }
-	Address const& author() const { return m_author; }
-	u256 const& timestamp() const { return m_timestamp; }
-	u256 const& difficulty() const { return m_difficulty; }
-	int64_t gasLimit() const { return m_gasLimit; }
-	LastHashes const& lastHashes() const { return m_lastHashes; }
+	u256 const& number() const { return m_headerInfo.number(); }
+	Address const& author() const { return m_headerInfo.author(); }
+	u256 const& timestamp() const { return m_headerInfo.timestamp(); }
+	u256 const& difficulty() const { return m_headerInfo.difficulty(); }
+	u256 const& gasLimit() const { return m_headerInfo.gasLimit(); }
+	LastBlockHashesFace const& lastHashes() const { return m_lastHashes; }
 	u256 const& gasUsed() const { return m_gasUsed; }
 
-	void setNumber(u256 const& _v) { m_number = _v; }
-	void setAuthor(Address const& _v) { m_author = _v; }
-	void setTimestamp(u256 const& _v) { m_timestamp = _v; }
-	void setDifficulty(u256 const& _v) { m_difficulty = _v; }
-	void setGasLimit(int64_t _v) { m_gasLimit = _v; }
-	void setLastHashes(LastHashes const& _lh) { m_lastHashes = _lh; }
-	void setLastHashes(LastHashes&& _lh) { m_lastHashes = _lh; }
-	void setGasUsed(u256 const& _v) { m_gasUsed = _v; }
-
 private:
-	u256 m_number;
-	Address m_author;
-	u256 m_timestamp;
-	u256 m_difficulty;
-	int64_t m_gasLimit;
-	LastHashes m_lastHashes;
+	BlockHeader m_headerInfo;
+	LastBlockHashesFace const& m_lastHashes;
 	u256 m_gasUsed;
 };
 
 /**
  * @brief Interface and null implementation of the class for specifying VM externalities.
  */
-class ExtVMFace
+class ExtVMFace: public evm_context
 {
 public:
 	/// Null constructor.
 	ExtVMFace() = default;
 
 	/// Full constructor.
-	ExtVMFace(EnvInfo const& _envInfo, Address _myAddress, Address _caller, Address _origin, u256 _value, u256 _gasPrice, bytesConstRef _data, bytes _code, h256 const& _codeHash, unsigned _depth);
+	ExtVMFace(EnvInfo const& _envInfo, Address _myAddress, Address _caller, Address _origin, u256 _value, u256 _gasPrice, bytesConstRef _data, bytes _code, h256 const& _codeHash, unsigned _depth, bool _staticCall);
 
 	virtual ~ExtVMFace() = default;
 
 	ExtVMFace(ExtVMFace const&) = delete;
-	void operator=(ExtVMFace) = delete;
+	ExtVMFace& operator=(ExtVMFace const&) = delete;
 
 	/// Read storage location.
 	virtual u256 store(u256) { return 0; }
@@ -250,11 +197,8 @@ public:
 	/// Read address's code.
 	virtual bytes const& codeAt(Address) { return NullBytes; }
 
-	/// Subtract amount from account's balance.
-	virtual void subBalance(u256) {}
-
-	/// Determine account's TX count.
-	virtual u256 txCount(Address) { return 0; }
+	/// @returns the size of the code in bytes at the given address.
+	virtual size_t codeSizeAt(Address) { return 0; }
 
 	/// Does the account exist?
 	virtual bool exists(Address) { return false; }
@@ -263,22 +207,17 @@ public:
 	virtual void suicide(Address) { sub.suicides.insert(myAddress); }
 
 	/// Create a new (contract) account.
-	virtual h160 create(u256, u256&, bytesConstRef, OnOpFunc const&) { return h160(); }
+	virtual std::pair<h160, owning_bytes_ref> create(u256, u256&, bytesConstRef, Instruction, u256, OnOpFunc const&) = 0;
 
 	/// Make a new message call.
-	virtual bool call(CallParameters&) { return false; }
+	/// @returns success flag and output data, if any.
+	virtual std::pair<bool, owning_bytes_ref> call(CallParameters&) = 0;
 
 	/// Revert any changes made (by any of the other calls).
 	virtual void log(h256s&& _topics, bytesConstRef _data) { sub.logs.push_back(LogEntry(myAddress, std::move(_topics), _data.toBytes())); }
 
-	/// Revert any changes made (by any of the other calls).
-	virtual void revert() {}
-
 	/// Hash of a block if within the last 256 blocks, or h256() otherwise.
-	h256 blockHash(u256 _number) { return _number < envInfo().number() && _number >= (std::max<u256>(256, envInfo().number()) - 256) ? envInfo().lastHashes()[(unsigned)(envInfo().number() - 1 - _number)] : h256(); }
-
-	/// Get the code at the given location in code ROM.
-	byte getCode(u256 _n) const { return _n < code.size() ? code[(size_t)_n] : 0; }
+	virtual h256 blockHash(u256 _number) = 0;
 
 	/// Get the execution environment information.
 	EnvInfo const& envInfo() const { return m_envInfo; }
@@ -301,7 +240,18 @@ public:
 	h256 codeHash;				///< SHA3 hash of the executing code
 	SubState sub;				///< Sub-band VM state (suicides, refund counter, logs).
 	unsigned depth = 0;			///< Depth of the present call.
+	bool staticCall = false;	///< Throw on state changing.
 };
+
+inline evm_address toEvmC(Address const& _addr)
+{
+	return reinterpret_cast<evm_address const&>(_addr);
+}
+
+inline evm_uint256be toEvmC(h256 const& _h)
+{
+	return reinterpret_cast<evm_uint256be const&>(_h);
+}
 
 }
 }

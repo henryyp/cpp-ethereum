@@ -1,9 +1,12 @@
 
 set(SOURCES
 	ExtVMFace.cpp
+	Instruction.cpp
 	VM.cpp
 	VMOpt.cpp
 	VMCalls.cpp
+	VMSIMD.cpp
+	VMValidate.cpp
 	VMFactory.cpp
 )
 
@@ -18,15 +21,9 @@ file(GLOB HEADERS "*.h")
 
 add_library(evm ${SOURCES} ${HEADERS})
 
-find_package(Eth)
-
-target_include_directories(evm PRIVATE ..)
-target_link_libraries(evm ${Eth_ETHCORE_LIBRARIES})
-target_link_libraries(evm ${Eth_EVMCORE_LIBRARIES})
+target_link_libraries(evm PUBLIC ethcore devcore PRIVATE jsoncpp_lib_static)
+target_include_directories(evm PUBLIC ../evmjit/include PRIVATE ../utils)
 
 if (EVMJIT)
-	target_include_directories(evm PRIVATE ../evmjit/include)
-	target_link_libraries(evm ${Eth_EVMJIT_LIBRARIES})
+	target_link_libraries(evm PRIVATE evmjit)
 endif()
-
-install(TARGETS evm RUNTIME DESTINATION bin ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)

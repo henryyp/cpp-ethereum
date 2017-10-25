@@ -1,22 +1,6 @@
-aux_source_directory(. SRC_LIST)
-
+file(GLOB SOURCES "*.cpp")
 file(GLOB HEADERS "*.h")
 
-add_library(devcrypto ${SRC_LIST} ${HEADERS})
-add_definitions(-D_GLIBCXX_USE_CXX11_ABI=1)
-
-eth_use(devcrypto REQUIRED Cryptopp)
-
-find_package(Dev)
-find_package(Utils)
-
-target_include_directories(devcrypto PRIVATE ..)
+add_library(devcrypto ${SOURCES} ${HEADERS})
 target_include_directories(devcrypto PRIVATE ../utils)
-target_link_libraries(devcrypto ${Dev_DEVCORE_LIBRARIES})
-target_link_libraries(devcrypto ${Utils_SCRYPT_LIBRARIES})
-
-if (NOT EMSCRIPTEN)
-	target_link_libraries(devcrypto ${Utils_SECP256K1_LIBRARIES})
-endif ()
-
-install(TARGETS devcrypto RUNTIME DESTINATION bin ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+target_link_libraries(devcrypto PUBLIC devcore Secp256k1 PRIVATE libff::ff cryptopp-static scrypt)

@@ -21,12 +21,13 @@ along with cpp-ethereum.  If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 
-#ifndef WIN32
+#if !defined(_WIN32)
 
-#include <string>
-#include <thread>
-#include <sys/un.h>
 #include "IpcServerBase.h"
+#include <atomic>
+#include <thread>
+#include <string>
+#include <sys/un.h>
 
 namespace dev
 {
@@ -45,7 +46,7 @@ protected:
 	size_t Read(int _connection, void* _data, size_t _size) override;
 
 	sockaddr_un m_address;
-	int m_socket = 0;
+	std::atomic<int> m_socket{0};
 };
 
 } // namespace dev

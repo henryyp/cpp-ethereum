@@ -29,7 +29,6 @@
 #include "GasPricer.h"
 #include "LogFilter.h"
 #include "Transaction.h"
-#include "AccountDiff.h"
 #include "BlockDetails.h"
 
 namespace dev
@@ -61,7 +60,6 @@ struct GasEstimationProgress
 };
 
 using GasEstimationCallback = std::function<void(GasEstimationProgress const&)>;
-extern const u256 c_maxGasEstimate;
 
 /**
  * @brief Main API hub for interfacing with Ethereum.
@@ -97,13 +95,6 @@ public:
 	ExecutionResult call(Secret const& _secret, u256 _value, Address _dest, bytes const& _data, u256 _gas, u256 _gasPrice, BlockNumber _blockNumber, FudgeFactor _ff = FudgeFactor::Strict) { return call(toAddress(_secret), _value, _dest, _data, _gas, _gasPrice, _blockNumber, _ff); }
 	ExecutionResult call(Secret const& _secret, u256 _value, Address _dest, bytes const& _data, u256 _gas, u256 _gasPrice, FudgeFactor _ff = FudgeFactor::Strict) { return call(toAddress(_secret), _value, _dest, _data, _gas, _gasPrice, _ff); }
 
-	/// Does the given creation. Nothing is recorded into the state.
-	/// @returns the pair of the Address of the created contract together with its code.
-	virtual ExecutionResult create(Address const& _from, u256 _value, bytes const& _data, u256 _gas, u256 _gasPrice, BlockNumber _blockNumber, FudgeFactor _ff = FudgeFactor::Strict) = 0;
-	ExecutionResult create(Address const& _from, u256 _value, bytes const& _data = bytes(), u256 _gas = 1000000, u256 _gasPrice = DefaultGasPrice, FudgeFactor _ff = FudgeFactor::Strict) { return create(_from, _value, _data, _gas, _gasPrice, m_default, _ff); }
-	ExecutionResult create(Secret const& _secret, u256 _value, bytes const& _data, u256 _gas, u256 _gasPrice, BlockNumber _blockNumber, FudgeFactor _ff = FudgeFactor::Strict) { return create(toAddress(_secret), _value, _data, _gas, _gasPrice, _blockNumber, _ff); }
-	ExecutionResult create(Secret const& _secret, u256 _value, bytes const& _data, u256 _gas, u256 _gasPrice, FudgeFactor _ff = FudgeFactor::Strict) { return create(toAddress(_secret), _value, _data, _gas, _gasPrice, _ff); }
-
 	/// Injects the RLP-encoded transaction given by the _rlp into the transaction queue directly.
 	virtual ImportResult injectTransaction(bytes const& _rlp, IfDropped _id = IfDropped::Ignore) = 0;
 
@@ -113,7 +104,7 @@ public:
 	/// Estimate gas usage for call/create.
 	/// @param _maxGas An upper bound value for estimation, if not provided default value of c_maxGasEstimate will be used.
 	/// @param _callback Optional callback function for progress reporting
-	virtual std::pair<u256, ExecutionResult> estimateGas(Address const& _from, u256 _value, Address _dest, bytes const& _data, u256 _maxGas, u256 _gasPrice, BlockNumber _blockNumber, GasEstimationCallback const& _callback = GasEstimationCallback()) = 0;
+	virtual std::pair<u256, ExecutionResult> estimateGas(Address const& _from, u256 _value, Address _dest, bytes const& _data, int64_t _maxGas, u256 _gasPrice, BlockNumber _blockNumber, GasEstimationCallback const& _callback = GasEstimationCallback()) = 0;
 
 	// [STATE-QUERY API]
 
@@ -125,7 +116,7 @@ public:
 	u256 stateAt(Address _a, u256 _l) const { return stateAt(_a, _l, m_default); }
 	bytes codeAt(Address _a) const { return codeAt(_a, m_default); }
 	h256 codeHashAt(Address _a) const { return codeHashAt(_a, m_default); }
-	std::unordered_map<u256, u256> storageAt(Address _a) const { return storageAt(_a, m_default); }
+	std::map<h256, std::pair<u256, u256>> storageAt(Address _a) const { return storageAt(_a, m_default); }
 
 	virtual u256 balanceAt(Address _a, BlockNumber _block) const = 0;
 	virtual u256 countAt(Address _a, BlockNumber _block) const = 0;
@@ -133,7 +124,7 @@ public:
 	virtual h256 stateRootAt(Address _a, BlockNumber _block) const = 0;
 	virtual bytes codeAt(Address _a, BlockNumber _block) const = 0;
 	virtual h256 codeHashAt(Address _a, BlockNumber _block) const = 0;
-	virtual std::unordered_map<u256, u256> storageAt(Address _a, BlockNumber _block) const = 0;
+	virtual std::map<h256, std::pair<u256, u256>> storageAt(Address _a, BlockNumber _block) const = 0;
 
 	// [LOGS API]
 	
@@ -199,11 +190,6 @@ public:
 	/// @TODO: Remove in favour of transactions().
 	virtual Transactions pending() const = 0;
 	virtual h256s pendingHashes() const = 0;
-
-	/// Differences between transactions.
-	StateDiff diff(unsigned _txi) const { return diff(_txi, m_default); }
-	virtual StateDiff diff(unsigned _txi, h256 _block) const = 0;
-	virtual StateDiff diff(unsigned _txi, BlockNumber _block) const = 0;
 
 	/// Get a list of all active addresses.
 	/// NOTE: This only works when compiled with ETH_FATDB; otherwise will throw InterfaceNotSupported.

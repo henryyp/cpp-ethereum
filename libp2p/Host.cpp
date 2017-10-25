@@ -58,13 +58,13 @@ ReputationManager::ReputationManager()
 {
 }
 
-void ReputationManager::noteRude(Session const& _s, std::string const& _sub)
+void ReputationManager::noteRude(SessionFace const& _s, std::string const& _sub)
 {
 	DEV_WRITE_GUARDED(x_nodes)
 		m_nodes[make_pair(_s.id(), _s.info().clientVersion)].subs[_sub].isRude = true;
 }
 
-bool ReputationManager::isRude(Session const& _s, std::string const& _sub) const
+bool ReputationManager::isRude(SessionFace const& _s, std::string const& _sub) const
 {
 	DEV_READ_GUARDED(x_nodes)
 	{
@@ -78,13 +78,13 @@ bool ReputationManager::isRude(Session const& _s, std::string const& _sub) const
 	return false;
 }
 
-void ReputationManager::setData(Session const& _s, std::string const& _sub, bytes const& _data)
+void ReputationManager::setData(SessionFace const& _s, std::string const& _sub, bytes const& _data)
 {
 	DEV_WRITE_GUARDED(x_nodes)
 		m_nodes[make_pair(_s.id(), _s.info().clientVersion)].subs[_sub].data = _data;
 }
 
-bytes ReputationManager::data(Session const& _s, std::string const& _sub) const
+bytes ReputationManager::data(SessionFace const& _s, std::string const& _sub) const
 {
 	DEV_READ_GUARDED(x_nodes)
 	{
@@ -119,6 +119,7 @@ Host::Host(string const& _clientVersion, NetworkPreferences const& _n, bytesCons
 Host::~Host()
 {
 	stop();
+	terminate();
 }
 
 void Host::start()
@@ -142,16 +143,10 @@ void Host::stop()
 	// such tasks may involve socket reads from Capabilities that maintain references
 	// to resources we're about to free.
 
-	{
-		// Although m_run is set by stop() or start(), it effects m_runTimer so x_runTimer is used instead of a mutex for m_run.
-		Guard l(x_runTimer);
-		// ignore if already stopped/stopping
-		if (!m_run)
-			return;
-		
-		// signal run() to prepare for shutdown and reset m_timer
-		m_run = false;
-	}
+	// ignore if already stopped/stopping, at the same time,
+	// signal run() to prepare for shutdown and reset m_timer
+	if (!m_run.exchange(false))
+		return;
 
 	// wait for m_timer to reset (indicating network scheduler has stopped)
 	while (!!m_timer)
@@ -230,6 +225,12 @@ void Host::doneWorking()
 	m_sessions.clear();
 }
 
+bool Host::isRequiredPeer(NodeID const& _id) const
+{
+	Guard l(x_requiredPeers);
+	return m_requiredPeers.count(_id);
+}
+
 void Host::startPeerSession(Public const& _id, RLP const& _rlp, unique_ptr<RLPXFrameCoder>&& _io, std::shared_ptr<RLPXSocket> const& _s)
 {
 	// session maybe ingress or egress so m_peers and node table entries may not exist
@@ -280,7 +281,7 @@ void Host::startPeerSession(Public const& _id, RLP const& _rlp, unique_ptr<RLPXF
 	clog(NetMessageSummary) << "Hello: " << clientVersion << "V[" << protocolVersion << "]" << _id << showbase << capslog.str() << dec << listenPort;
 	
 	// create session so disconnects are managed
-	auto ps = make_shared<Session>(this, move(_io), _s, p, PeerSessionInfo({_id, clientVersion, p->endpoint.address.to_string(), listenPort, chrono::steady_clock::duration(), _rlp[2].toSet<CapDesc>(), 0, map<string, string>(), protocolVersion}));
+	shared_ptr<SessionFace> ps = make_shared<Session>(this, move(_io), _s, p, PeerSessionInfo({_id, clientVersion, p->endpoint.address.to_string(), listenPort, chrono::steady_clock::duration(), _rlp[2].toSet<CapDesc>(), 0, map<string, string>(), protocolVersion}));
 	if (protocolVersion < dev::p2p::c_protocolVersion - 1)
 	{
 		ps->disconnect(IncompatibleProtocol);
@@ -292,7 +293,7 @@ void Host::startPeerSession(Public const& _id, RLP const& _rlp, unique_ptr<RLPXF
 		return;
 	}
 
-	if (m_netPrefs.pin && !m_requiredPeers.count(_id))
+	if (m_netPrefs.pin && !isRequiredPeer(_id))
 	{
 		cdebug << "Unexpected identity from peer (got" << _id << ", must be one of " << m_requiredPeers << ")";
 		ps->disconnect(UnexpectedIdentity);
@@ -318,7 +319,6 @@ void Host::startPeerSession(Public const& _id, RLP const& _rlp, unique_ptr<RLPXF
 		}
 
 		unsigned offset = (unsigned)UserPacket;
-		uint16_t cnt = 1;
 
 		// todo: mutex Session::m_capabilities and move for(:caps) out of mutex.
 		for (auto const& i: caps)
@@ -327,13 +327,8 @@ void Host::startPeerSession(Public const& _id, RLP const& _rlp, unique_ptr<RLPXF
 			if (!pcap)
 				return ps->disconnect(IncompatibleProtocol);
 
-			if (Session::isFramingAllowedForVersion(protocolVersion))
-				pcap->newPeerCapability(ps, 0, i, cnt++);
-			else
-			{
-				pcap->newPeerCapability(ps, offset, i, 0);
-				offset += pcap->messageCount();
-			}
+			pcap->newPeerCapability(ps, offset, i);
+			offset += pcap->messageCount();
 		}
 
 		ps->start();
@@ -477,16 +472,19 @@ void Host::runAcceptor()
 	}
 }
 
-std::unordered_map<Public, std::string> const& Host::pocHosts()
+std::unordered_map<Public, std::string> Host::pocHosts()
 {
-	static const std::unordered_map<Public, std::string> c_ret = {
-		{ Public("5374c1bff8df923d3706357eeb4983cd29a63be40a269aaa2296ee5f3b2119a8978c0ed68b8f6fc84aad0df18790417daadf91a4bfbb786a16c9b0a199fa254a"), "gav.ethdev.com:30300" },
-		{ Public("e58d5e26b3b630496ec640f2530f3e7fa8a8c7dfe79d9e9c4aac80e3730132b869c852d3125204ab35bb1b1951f6f2d40996c1034fd8c5a69b383ee337f02ddc"), "gav.ethdev.com:30303" },
+	return {
+		// Mainnet:
 		{ Public("a979fb575495b8d6db44f750317d0f4622bf4c2aa3365d6af7c284339968eef29b69ad0dce72a4d8db5ebb4968de0e3bec910127f134779fbcb0cb6d3331163c"), "52.16.188.185:30303" },
-		{ Public("7f25d3eab333a6b98a8b5ed68d962bb22c876ffcd5561fca54e3c2ef27f754df6f7fd7c9b74cc919067abac154fb8e1f8385505954f161ae440abc355855e034"), "54.207.93.166:30303" },
-		{ Public("5374c1bff8df923d3706357eeb4983cd29a63be40a269aaa2296ee5f3b2119a8978c0ed68b8f6fc84aad0df18790417daadf91a4bfbb786a16c9b0a199fa254a"), "92.51.165.126:30303" },
+		{ Public("3f1d12044546b76342d59d4a05532c14b85aa669704bfe1f864fe079415aa2c02d743e03218e57a33fb94523adb54032871a6c51b2cc5514cb7c7e35b3ed0a99"), "13.93.211.84:30303" },
+		{ Public("78de8a0916848093c73790ead81d1928bec737d565119932b98c6b100d944b7a95e94f847f689fc723399d2e31129d182f7ef3863f2b4c820abbf3ab2722344d"), "191.235.84.50:30303" },
+		{ Public("158f8aab45f6d19c6cbf4a089c2670541a8da11978a2f90dbf6a502a4a3bab80d288afdbeb7ec0ef6d92de563767f3b1ea9e8e334ca711e9f8e2df5a0385e8e6"), "13.75.154.138:30303" },
+		{ Public("1118980bf48b0a3640bdba04e0fe78b1add18e1cd99bf22d53daac1fd9972ad650df52176e7c7d89d1114cfef2bc23a2959aa54998a46afcf7d91809f0855082"), "52.74.57.123:30303" },
+		// Ropsten:
+		{ Public("6ce05930c72abc632c58e2e4324f7c7ea478cec0ed4fa2528982cf34483094e9cbc9216e7aa349691242576d552a2a56aaeae426c5303ded677ce455ba1acd9d"), "13.84.180.240:30303" },
+		{ Public("20c9ad97c081d63397d7b685a412227a40e23c8bdc6688c6f37e97cfbc22d2b4d1db1510d8f61e6a8866ad7f0e17c02b14182d37ea7c3c8b9c2683aeb6b733a1"), "52.169.14.227:30303" },
 	};
-	return c_ret;
 }
 
 void Host::addPeer(NodeSpec const& _s, PeerType _t)
@@ -515,7 +513,10 @@ void Host::addNode(NodeID const& _node, NodeIPEndpoint const& _endpoint)
 
 void Host::requirePeer(NodeID const& _n, NodeIPEndpoint const& _endpoint)
 {
-	m_requiredPeers.insert(_n);
+	{
+		Guard l(x_requiredPeers);
+		m_requiredPeers.insert(_n);
+	}
 
 	if (!m_run)
 		return;
@@ -631,8 +632,7 @@ PeerSessionInfos Host::peerSessionInfo() const
 	for (auto& i: m_sessions)
 		if (auto j = i.second.lock())
 			if (j->isConnected())
-				DEV_GUARDED(j->x_info)
-					ret.push_back(j->m_info);
+				ret.push_back(j->info());
 	return ret;
 }
 
@@ -641,7 +641,7 @@ size_t Host::peerCount() const
 	unsigned retCount = 0;
 	RecursiveGuard l(x_sessions);
 	for (auto& i: m_sessions)
-		if (std::shared_ptr<Session> j = i.second.lock())
+		if (std::shared_ptr<SessionFace> j = i.second.lock())
 			if (j->isConnected())
 				retCount++;
 	return retCount;
@@ -804,7 +804,7 @@ void Host::disconnectLatePeers()
 	RecursiveGuard l(x_sessions);
 	for (auto p: m_sessions)
 		if (auto pp = p.second.lock())
-			if (now - c_keepAliveTimeOut > m_lastPing && pp->m_lastReceived < m_lastPing)
+			if (now - c_keepAliveTimeOut > m_lastPing && pp->lastReceived() < m_lastPing)
 				pp->disconnect(PingTimeout);
 }
 
@@ -939,6 +939,16 @@ void Host::restoreNetwork(bytesConstRef _b)
 			}
 		}
 	}
+}
+
+bool Host::peerSlotsAvailable(Host::PeerSlotType _type)
+{
+	size_t peerNodeConns = 0;
+	{
+		Guard l(x_pendingNodeConns);
+		peerNodeConns = m_pendingPeerConns.size();
+	}
+	return peerCount() + peerNodeConns < peerSlots(_type);
 }
 
 KeyPair Host::networkAlias(bytesConstRef _b)

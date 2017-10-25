@@ -20,12 +20,14 @@
  */
 
 #include "AES.h"
-#include <libdevcore/Common.h>
-#include "CryptoPP.h"
-using namespace std;
+#include <cryptopp/aes.h>
+#include <cryptopp/filters.h>
+#include <cryptopp/pwdbased.h>
+#include <cryptopp/modes.h>
+#include <cryptopp/sha.h>
+
 using namespace dev;
 using namespace dev::crypto;
-using namespace CryptoPP;
 
 bytes dev::aesDecrypt(bytesConstRef _ivCipher, std::string const& _password, unsigned _rounds, bytesConstRef _salt)
 {
@@ -49,9 +51,10 @@ bytes dev::aesDecrypt(bytesConstRef _ivCipher, std::string const& _password, uns
 		stfDecryptor.MessageEnd();
 		return asBytes(decrypted);
 	}
-	catch (exception const& e)
+	catch (std::exception const& e)
 	{
-		cerr << e.what() << endl;
+		// FIXME: Handle this error better.
+		std::cerr << e.what() << '\n';
 		return bytes();
 	}
 }

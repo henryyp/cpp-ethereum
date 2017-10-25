@@ -22,14 +22,13 @@
 
 #include "JsonHelper.h"
 
-#include <libevmcore/Instruction.h>
 #include <libethcore/SealEngine.h>
 #include <libethereum/Client.h>
 #include <libwebthree/WebThree.h>
 #include <libethcore/CommonJS.h>
-#include <libethcore/ICAP.h>
 #include <libwhisper/Message.h>
 #include <libwhisper/WhisperHost.h>
+#include <jsonrpccpp/common/exception.h>
 using namespace std;
 using namespace dev;
 using namespace eth;
@@ -45,11 +44,11 @@ Json::Value toJson(unordered_map<u256, u256> const& _storage)
 	return res;
 }
 
-Json::Value toJson(map<u256, u256> const& _storage)
+Json::Value toJson(map<h256, pair<u256, u256>> const& _storage)
 {
 	Json::Value res(Json::objectValue);
 	for (auto i: _storage)
-		res[toJS(i.first)] = toJS(i.second);
+		res[toJS(u256(i.second.first))] = toJS(i.second.second);
 	return res;
 }
 
@@ -184,7 +183,10 @@ Json::Value toJson(dev::eth::TransactionSkeleton const& _t)
 Json::Value toJson(dev::eth::TransactionReceipt const& _t)
 {
 	Json::Value res;
-	res["stateRoot"] = toJS(_t.stateRoot());
+	if (_t.hasStatusCode())
+		res["statusCode"] = toJS(_t.statusCode());
+	else
+		res["stateRoot"] = toJS(_t.stateRoot());
 	res["gasUsed"] = toJS(_t.gasUsed());
 	res["bloom"] = toJS(_t.bloom());
 	res["log"] = dev::toJson(_t.log());
@@ -533,6 +535,25 @@ pair<shh::Topics, Public> toWatch(Json::Value const& _json)
 	return make_pair(bt, to);
 }
 
+}
+
+// ////////////////////////////////////////////////////////////////////////////////////
+// rpc
+// ////////////////////////////////////////////////////////////////////////////////////
+
+namespace rpc
+{
+h256 h256fromHex(string const& _s)
+{
+	try
+	{
+		return h256(_s);
+	}
+	catch (boost::exception const&)
+	{
+		throw jsonrpc::JsonRpcException("Invalid hex-encoded string: " + _s);
+	}
+}
 }
 
 }

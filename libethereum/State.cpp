@@ -21,21 +21,15 @@
 
 #include "State.h"
 
-#include <ctime>
 #include <boost/filesystem.hpp>
 #include <boost/timer.hpp>
-#include <libdevcore/CommonIO.h>
 #include <libdevcore/Assertions.h>
 #include <libdevcore/TrieHash.h>
-#include <libevmcore/Instruction.h>
-#include <libethcore/Exceptions.h>
 #include <libevm/VMFactory.h>
 #include "BlockChain.h"
+#include "Block.h"
 #include "Defaults.h"
 #include "ExtVM.h"
-#include "Executive.h"
-#include "CachedAddressState.h"
-#include "BlockChain.h"
 #include "TransactionQueue.h"
 
 using namespace std;
@@ -43,12 +37,25 @@ using namespace dev;
 using namespace dev::eth;
 namespace fs = boost::filesystem;
 
-#define ETH_TIMED_ENACTMENTS 0
-
 const char* StateSafeExceptions::name() { return EthViolet "⚙" EthBlue " ℹ"; }
 const char* StateDetail::name() { return EthViolet "⚙" EthWhite " ◌"; }
 const char* StateTrace::name() { return EthViolet "⚙" EthGray " ◎"; }
 const char* StateChat::name() { return EthViolet "⚙" EthWhite " ◌"; }
+
+namespace
+{
+
+/// @returns true when normally halted; false when exceptionally halted.
+bool executeTransaction(Executive& _e, Transaction const& _t, OnOpFunc const& _onOp)
+{
+	_e.initialize(_t);
+
+	if (!_e.execute())
+		_e.go(_onOp);
+	return _e.finalize();
+}
+
+}
 
 State::State(u256 const& _accountStartNonce, OverlayDB const& _db, BaseState _bs):
 	m_db(_db),
@@ -58,41 +65,40 @@ State::State(u256 const& _accountStartNonce, OverlayDB const& _db, BaseState _bs
 	if (_bs != BaseState::PreExisting)
 		// Initialise to the state entailed by the genesis block; this guarantees the trie is built correctly.
 		m_state.init();
-	paranoia("end of normal construction.", true);
 }
 
 State::State(State const& _s):
 	m_db(_s.m_db),
 	m_state(&m_db, _s.m_state.root(), Verification::Skip),
 	m_cache(_s.m_cache),
+	m_unchangedCacheEntries(_s.m_unchangedCacheEntries),
+	m_nonExistingAccountsCache(_s.m_nonExistingAccountsCache),
 	m_touched(_s.m_touched),
 	m_accountStartNonce(_s.m_accountStartNonce)
-{
-	paranoia("after state cloning (copy cons).", true);
-}
+{}
 
-OverlayDB State::openDB(std::string const& _basePath, h256 const& _genesisHash, WithExisting _we)
+OverlayDB State::openDB(fs::path const& _basePath, h256 const& _genesisHash, WithExisting _we)
 {
-	std::string path = _basePath.empty() ? Defaults::get()->m_dbPath : _basePath;
+	fs::path path = _basePath.empty() ? Defaults::get()->m_dbPath : _basePath;
 
 	if (_we == WithExisting::Kill)
 	{
-		cnote << "Killing state database (WithExisting::Kill).";
-		boost::filesystem::remove_all(path + "/state");
+		clog(StateDetail) << "Killing state database (WithExisting::Kill).";
+		fs::remove_all(path / fs::path("state"));
 	}
 
-	path += "/" + toHex(_genesisHash.ref().cropped(0, 4)) + "/" + toString(c_databaseVersion);
-	boost::filesystem::create_directories(path);
+	path /= fs::path(toHex(_genesisHash.ref().cropped(0, 4))) / fs::path(toString(c_databaseVersion));
+	fs::create_directories(path);
 	DEV_IGNORE_EXCEPTIONS(fs::permissions(path, fs::owner_all));
 
 	ldb::Options o;
 	o.max_open_files = 256;
 	o.create_if_missing = true;
 	ldb::DB* db = nullptr;
-	ldb::Status status = ldb::DB::Open(o, path + "/state", &db);
+	ldb::Status status = ldb::DB::Open(o, (path / fs::path("state")).string(), &db);
 	if (!status.ok() || !db)
 	{
-		if (boost::filesystem::space(path + "/state").available < 1024)
+		if (fs::space(path / fs::path("state")).available < 1024)
 		{
 			cwarn << "Not enough available space found on hard drive. Please free some up and then re-run. Bailing.";
 			BOOST_THROW_EXCEPTION(NotEnoughAvailableSpace());
@@ -102,20 +108,20 @@ OverlayDB State::openDB(std::string const& _basePath, h256 const& _genesisHash, 
 			cwarn << status.ToString();
 			cwarn <<
 				"Database " <<
-				(path + "/state") <<
+				(path / fs::path("state")) <<
 				"already open. You appear to have another instance of ethereum running. Bailing.";
 			BOOST_THROW_EXCEPTION(DatabaseAlreadyOpen());
 		}
 	}
 
-	ctrace << "Opened state DB.";
+	clog(StateDetail) << "Opened state DB.";
 	return OverlayDB(db);
 }
 
 void State::populateFrom(AccountMap const& _map)
 {
 	eth::commit(_map, m_state);
-	commit();
+	commit(State::CommitBehaviour::KeepEmptyAccounts);
 }
 
 u256 const& State::requireAccountStartNonce() const
@@ -133,20 +139,11 @@ void State::noteAccountStartNonce(u256 const& _actual)
 		BOOST_THROW_EXCEPTION(IncorrectAccountStartNonceInState());
 }
 
-void State::paranoia(std::string const& _when, bool _enforceRefs) const
+void State::removeEmptyAccounts()
 {
-#if ETH_PARANOIA && !ETH_FATDB
-	// TODO: variable on context; just need to work out when there should be no leftovers
-	// [in general this is hard since contract alteration will result in nodes in the DB that are no directly part of the state DB].
-	if (!isTrieGood(_enforceRefs, false))
-	{
-		cwarn << "BAD TRIE" << _when;
-		BOOST_THROW_EXCEPTION(InvalidTrie());
-	}
-#else
-	(void)_when;
-	(void)_enforceRefs;
-#endif
+	for (auto& i: m_cache)
+		if (i.second.isDirty() && i.second.isEmpty())
+			i.second.kill();
 }
 
 State& State::operator=(State const& _s)
@@ -157,94 +154,81 @@ State& State::operator=(State const& _s)
 	m_db = _s.m_db;
 	m_state.open(&m_db, _s.m_state.root(), Verification::Skip);
 	m_cache = _s.m_cache;
+	m_unchangedCacheEntries = _s.m_unchangedCacheEntries;
+	m_nonExistingAccountsCache = _s.m_nonExistingAccountsCache;
 	m_touched = _s.m_touched;
 	m_accountStartNonce = _s.m_accountStartNonce;
-	paranoia("after state cloning (assignment op)", true);
 	return *this;
 }
 
-StateDiff State::diff(State const& _c, bool _quick) const
+Account const* State::account(Address const& _a) const
 {
-	StateDiff ret;
-
-	std::unordered_set<Address> ads;
-	std::unordered_set<Address> trieAds;
-	std::unordered_set<Address> trieAdsD;
-
-	auto trie = SecureTrieDB<Address, OverlayDB>(const_cast<OverlayDB*>(&m_db), rootHash());
-	auto trieD = SecureTrieDB<Address, OverlayDB>(const_cast<OverlayDB*>(&_c.m_db), _c.rootHash());
-
-	if (_quick)
-	{
-		trieAds = m_touched;
-		trieAdsD = _c.m_touched;
-		(ads += m_touched) += _c.m_touched;
-	}
-	else
-	{
-		for (auto const& i: trie)
-			ads.insert(i.first), trieAds.insert(i.first);
-		for (auto const& i: trieD)
-			ads.insert(i.first), trieAdsD.insert(i.first);
-	}
-
-	for (auto const& i: m_cache)
-		ads.insert(i.first);
-	for (auto const& i: _c.m_cache)
-		ads.insert(i.first);
-
-	for (auto const& i: ads)
-	{
-		auto it = m_cache.find(i);
-		auto itD = _c.m_cache.find(i);
-		CachedAddressState source(trieAds.count(i) ? trie.at(i) : "", it != m_cache.end() ? &it->second : nullptr, &m_db);
-		CachedAddressState dest(trieAdsD.count(i) ? trieD.at(i) : "", itD != _c.m_cache.end() ? &itD->second : nullptr, &_c.m_db);
-		AccountDiff acd = source.diff(dest);
-		if (acd.changed())
-			ret.accounts[i] = acd;
-	}
-
-	return ret;
+	return const_cast<State*>(this)->account(_a);
 }
 
-void State::ensureCached(Address const& _a, bool _requireCode, bool _forceCreate) const
+Account* State::account(Address const& _addr)
 {
-	ensureCached(m_cache, _a, _requireCode, _forceCreate);
-}
+	auto it = m_cache.find(_addr);
+	if (it != m_cache.end())
+		return &it->second;
 
-void State::ensureCached(std::unordered_map<Address, Account>& _cache, const Address& _a, bool _requireCode, bool _forceCreate) const
-{
-	auto it = _cache.find(_a);
-	if (it == _cache.end())
+	if (m_nonExistingAccountsCache.count(_addr))
+		return nullptr;
+
+	// Populate basic info.
+	string stateBack = m_state.at(_addr);
+	if (stateBack.empty())
 	{
-		// populate basic info.
-		string stateBack = m_state.at(_a);
-		if (stateBack.empty() && !_forceCreate)
-			return;
-		RLP state(stateBack);
-		Account s;
-		if (state.isNull())
-			s = Account(requireAccountStartNonce(), 0, Account::NormalCreation);
-		else
-			s = Account(state[0].toInt<u256>(), state[1].toInt<u256>(), state[2].toHash<h256>(), state[3].toHash<h256>(), Account::Unchanged);
-		bool ok;
-		tie(it, ok) = _cache.insert(make_pair(_a, s));
+		m_nonExistingAccountsCache.insert(_addr);
+		return nullptr;
 	}
-	if (_requireCode && it != _cache.end() && !it->second.isFreshCode() && !it->second.codeCacheValid())
-		it->second.noteCode(it->second.codeHash() == EmptySHA3 ? bytesConstRef() : bytesConstRef(m_db.lookup(it->second.codeHash())));
+
+	clearCacheIfTooLarge();
+
+	RLP state(stateBack);
+	auto i = m_cache.emplace(
+		std::piecewise_construct,
+		std::forward_as_tuple(_addr),
+		std::forward_as_tuple(state[0].toInt<u256>(), state[1].toInt<u256>(), state[2].toHash<h256>(), state[3].toHash<h256>(), Account::Unchanged)
+	);
+	m_unchangedCacheEntries.push_back(_addr);
+	return &i.first->second;
 }
 
-void State::commit()
+void State::clearCacheIfTooLarge() const
 {
+	// TODO: Find a good magic number
+	while (m_unchangedCacheEntries.size() > 1000)
+	{
+		// Remove a random element
+		// FIXME: Do not use random device as the engine. The random device should be only used to seed other engine.
+		size_t const randomIndex = std::uniform_int_distribution<size_t>(0, m_unchangedCacheEntries.size() - 1)(dev::s_fixedHashEngine);
+
+		Address const addr = m_unchangedCacheEntries[randomIndex];
+		swap(m_unchangedCacheEntries[randomIndex], m_unchangedCacheEntries.back());
+		m_unchangedCacheEntries.pop_back();
+
+		auto cacheEntry = m_cache.find(addr);
+		if (cacheEntry != m_cache.end() && !cacheEntry->second.isDirty())
+			m_cache.erase(cacheEntry);
+	}
+}
+
+void State::commit(CommitBehaviour _commitBehaviour)
+{
+	if (_commitBehaviour == CommitBehaviour::RemoveEmptyAccounts)
+		removeEmptyAccounts();
 	m_touched += dev::eth::commit(m_cache, m_state);
+	m_changeLog.clear();
 	m_cache.clear();
+	m_unchangedCacheEntries.clear();
 }
 
 unordered_map<Address, u256> State::addresses() const
 {
 #if ETH_FATDB
 	unordered_map<Address, u256> ret;
-	for (auto i: m_cache)
+	for (auto& i: m_cache)
 		if (i.second.isAlive())
 			ret[i.first] = i.second.balance();
 	for (auto const& i: m_state)
@@ -259,143 +243,198 @@ unordered_map<Address, u256> State::addresses() const
 void State::setRoot(h256 const& _r)
 {
 	m_cache.clear();
+	m_unchangedCacheEntries.clear();
+	m_nonExistingAccountsCache.clear();
 //	m_touched.clear();
 	m_state.setRoot(_r);
-	paranoia("begin setRoot", true);
 }
 
 bool State::addressInUse(Address const& _id) const
 {
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it == m_cache.end())
+	return !!account(_id);
+}
+
+bool State::accountNonemptyAndExisting(Address const& _address) const
+{
+	if (Account const* a = account(_address))
+		return !a->isEmpty();
+	else
 		return false;
-	return true;
 }
 
 bool State::addressHasCode(Address const& _id) const
 {
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it == m_cache.end())
+	if (auto a = account(_id))
+		return a->codeHash() != EmptySHA3;
+	else
 		return false;
-	return it->second.isFreshCode() || it->second.codeHash() != EmptySHA3;
 }
 
 u256 State::balance(Address const& _id) const
 {
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it == m_cache.end())
+	if (auto a = account(_id))
+		return a->balance();
+	else
 		return 0;
-	return it->second.balance();
 }
 
-void State::noteSending(Address const& _id)
+void State::incNonce(Address const& _addr)
 {
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (asserts(it != m_cache.end()))
+	if (Account* a = account(_addr))
 	{
-		cwarn << "Sending from non-existant account. How did it pay!?!";
-		// this is impossible. but we'll continue regardless...
-		m_cache[_id] = Account(requireAccountStartNonce() + 1, 0);
+		auto oldNonce = a->nonce();
+		a->incNonce();
+		m_changeLog.emplace_back(_addr, oldNonce);
 	}
 	else
-		it->second.incNonce();
+		// This is possible if a transaction has gas price 0.
+		createAccount(_addr, Account(requireAccountStartNonce() + 1, 0));
+}
+
+void State::setNonce(Address const& _addr, u256 const& _newNonce)
+{
+	if (Account* a = account(_addr))
+	{
+		auto oldNonce = a->nonce();
+		a->setNonce(_newNonce);
+		m_changeLog.emplace_back(_addr, oldNonce);
+	}
+	else
+		// This is possible when a contract is being created.
+		createAccount(_addr, Account(_newNonce, 0));
 }
 
 void State::addBalance(Address const& _id, u256 const& _amount)
 {
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it == m_cache.end())
-		m_cache[_id] = Account(requireAccountStartNonce(), _amount, Account::NormalCreation);
-	else
-		it->second.addBalance(_amount);
-}
-
-void State::subBalance(Address const& _id, bigint const& _amount)
-{
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it == m_cache.end() || (bigint)it->second.balance() < _amount)
-		BOOST_THROW_EXCEPTION(NotEnoughCash());
-	else
-		it->second.addBalance(-_amount);
-}
-
-Address State::newContract(u256 const& _balance, bytes const& _code)
-{
-	auto h = sha3(_code);
-	m_db.insert(h, &_code);
-	while (true)
+	if (Account* a = account(_id))
 	{
-		Address ret = Address::random();
-		ensureCached(ret, false, false);
-		auto it = m_cache.find(ret);
-		if (it == m_cache.end())
-		{
-			m_cache[ret] = Account(requireAccountStartNonce(), _balance, EmptyTrie, h, Account::Changed);
-			return ret;
-		}
+		// Log empty account being touched. Empty touched accounts are cleared
+		// after the transaction, so this event must be also reverted.
+		// We only log the first touch (not dirty yet), and only for empty
+		// accounts, as other accounts does not matter.
+		// TODO: to save space we can combine this event with Balance by having
+		//       Balance and Balance+Touch events.
+		if (!a->isDirty() && a->isEmpty())
+			m_changeLog.emplace_back(Change::Touch, _id);
+
+		// Increase the account balance. This also is done for value 0 to mark
+		// the account as dirty. Dirty account are not removed from the cache
+		// and are cleared if empty at the end of the transaction.
+		a->addBalance(_amount);
 	}
-}
-
-u256 State::transactionsFrom(Address const& _id) const
-{
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it == m_cache.end())
-		return m_accountStartNonce;
 	else
-		return it->second.nonce();
+		createAccount(_id, {requireAccountStartNonce(), _amount});
+
+	if (_amount)
+		m_changeLog.emplace_back(Change::Balance, _id, _amount);
 }
 
-u256 State::storage(Address const& _id, u256 const& _memory) const
+void State::subBalance(Address const& _addr, u256 const& _value)
 {
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
+	if (_value == 0)
+		return;
 
-	// Account doesn't exist - exit now.
-	if (it == m_cache.end())
+	Account* a = account(_addr);
+	if (!a || a->balance() < _value)
+		// TODO: I expect this never happens.
+		BOOST_THROW_EXCEPTION(NotEnoughCash());
+
+	// Fall back to addBalance().
+	addBalance(_addr, 0 - _value);
+}
+
+void State::createContract(Address const& _address)
+{
+	createAccount(_address, {requireAccountStartNonce(), 0});
+}
+
+void State::createAccount(Address const& _address, Account const&& _account)
+{
+	assert(!addressInUse(_address) && "Account already exists");
+	m_cache[_address] = std::move(_account);
+	m_nonExistingAccountsCache.erase(_address);
+	m_changeLog.emplace_back(Change::Create, _address);
+}
+
+void State::kill(Address _addr)
+{
+	if (auto a = account(_addr))
+		a->kill();
+	// If the account is not in the db, nothing to kill.
+}
+
+u256 State::getNonce(Address const& _addr) const
+{
+	if (auto a = account(_addr))
+		return a->nonce();
+	else
+		return m_accountStartNonce;
+}
+
+u256 State::storage(Address const& _id, u256 const& _key) const
+{
+	if (Account const* a = account(_id))
+	{
+		auto mit = a->storageOverlay().find(_key);
+		if (mit != a->storageOverlay().end())
+			return mit->second;
+
+		// Not in the storage cache - go to the DB.
+		SecureTrieDB<h256, OverlayDB> memdb(const_cast<OverlayDB*>(&m_db), a->baseRoot());			// promise we won't change the overlay! :)
+		string payload = memdb.at(_key);
+		u256 ret = payload.size() ? RLP(payload).toInt<u256>() : 0;
+		a->setStorageCache(_key, ret);
+		return ret;
+	}
+	else
 		return 0;
-
-	// See if it's in the account's storage cache.
-	auto mit = it->second.storageOverlay().find(_memory);
-	if (mit != it->second.storageOverlay().end())
-		return mit->second;
-
-	// Not in the storage cache - go to the DB.
-	SecureTrieDB<h256, OverlayDB> memdb(const_cast<OverlayDB*>(&m_db), it->second.baseRoot());			// promise we won't change the overlay! :)
-	string payload = memdb.at(_memory);
-	u256 ret = payload.size() ? RLP(payload).toInt<u256>() : 0;
-	it->second.setStorage(_memory, ret);
-	return ret;
 }
 
-unordered_map<u256, u256> State::storage(Address const& _id) const
+void State::setStorage(Address const& _contract, u256 const& _key, u256 const& _value)
 {
-	unordered_map<u256, u256> ret;
+	m_changeLog.emplace_back(_contract, _key, storage(_contract, _key));
+	m_cache[_contract].setStorage(_key, _value);
+}
 
-	ensureCached(_id, false, false);
-	auto it = m_cache.find(_id);
-	if (it != m_cache.end())
+void State::clearStorage(Address const& _contract)
+{
+	h256 const& oldHash{m_cache[_contract].baseRoot()};
+	if (oldHash == EmptyTrie)
+		return;
+	m_changeLog.emplace_back(Change::StorageRoot, _contract, oldHash);
+	m_cache[_contract].clearStorage();
+}
+
+map<h256, pair<u256, u256>> State::storage(Address const& _id) const
+{
+	map<h256, pair<u256, u256>> ret;
+
+	if (Account const* a = account(_id))
 	{
 		// Pull out all values from trie storage.
-		if (it->second.baseRoot())
+		if (h256 root = a->baseRoot())
 		{
-			SecureTrieDB<h256, OverlayDB> memdb(const_cast<OverlayDB*>(&m_db), it->second.baseRoot());		// promise we won't alter the overlay! :)
-			for (auto const& i: memdb)
-				ret[i.first] = RLP(i.second).toInt<u256>();
+			SecureTrieDB<h256, OverlayDB> memdb(const_cast<OverlayDB*>(&m_db), root);		// promise we won't alter the overlay! :)
+
+			for (auto it = memdb.hashedBegin(); it != memdb.hashedEnd(); ++it)
+			{
+				h256 const hashedKey((*it).first);
+				u256 const key = h256(it.key());
+				u256 const value = RLP((*it).second).toInt<u256>();
+				ret[hashedKey] = make_pair(key, value);
+			}
 		}
 
 		// Then merge cached storage over the top.
-		for (auto const& i: it->second.storageOverlay())
+		for (auto const& i : a->storageOverlay())
+		{
+			h256 const key = i.first;
+			h256 const hashedKey = sha3(key);
 			if (i.second)
-				ret[i.first] = i.second;
+				ret[hashedKey] = i;
 			else
-				ret.erase(i.first);
+				ret.erase(hashedKey);
+		}
 	}
 	return ret;
 }
@@ -411,59 +450,102 @@ h256 State::storageRoot(Address const& _id) const
 	return EmptyTrie;
 }
 
-bytes const& State::code(Address const& _contract) const
+bytes const& State::code(Address const& _addr) const
 {
-	if (!addressHasCode(_contract))
+	Account const* a = account(_addr);
+	if (!a || a->codeHash() == EmptySHA3)
 		return NullBytes;
-	ensureCached(_contract, true, false);
-	return m_cache[_contract].code();
+
+	if (a->code().empty())
+	{
+		// Load the code from the backend.
+		Account* mutableAccount = const_cast<Account*>(a);
+		mutableAccount->noteCode(m_db.lookup(a->codeHash()));
+		CodeSizeCache::instance().store(a->codeHash(), a->code().size());
+	}
+
+	return a->code();
 }
 
-h256 State::codeHash(Address const& _contract) const
+void State::setCode(Address const& _address, bytes&& _code)
 {
-	if (!addressHasCode(_contract))
+	m_changeLog.emplace_back(_address, code(_address));
+	m_cache[_address].setCode(std::move(_code));
+}
+
+h256 State::codeHash(Address const& _a) const
+{
+	if (Account const* a = account(_a))
+		return a->codeHash();
+	else
 		return EmptySHA3;
-	if (m_cache[_contract].isFreshCode())
-		return sha3(code(_contract));
-	return m_cache[_contract].codeHash();
 }
 
-bool State::isTrieGood(bool _enforceRefs, bool _requireNoLeftOvers) const
+size_t State::codeSize(Address const& _a) const
 {
-	for (int e = 0; e < (_enforceRefs ? 2 : 1); ++e)
-		try
+	if (Account const* a = account(_a))
+	{
+		if (a->hasNewCode())
+			return a->code().size();
+		auto& codeSizeCache = CodeSizeCache::instance();
+		h256 codeHash = a->codeHash();
+		if (codeSizeCache.contains(codeHash))
+			return codeSizeCache.get(codeHash);
+		else
 		{
-			EnforceRefs r(m_db, !!e);
-			auto lo = m_state.leftOvers();
-			if (!lo.empty() && _requireNoLeftOvers)
-			{
-				cwarn << "LEFTOVERS" << (e ? "[enforced" : "[unenforced") << "refs]";
-				cnote << "Left:" << lo;
-				cnote << "Keys:" << m_db.keys();
-				m_state.debugStructure(cerr);
-				return false;
-			}
-			// TODO: Enable once fixed.
-/*			for (auto const& i: m_state)
-			{
-				RLP r(i.second);
-				SecureTrieDB<h256, OverlayDB> storageDB(const_cast<OverlayDB*>(&m_db), r[2].toHash<h256>());	// promise not to alter OverlayDB.
-				for (auto const& j: storageDB) { (void)j; }
-				if (!e && r[3].toHash<h256>() != EmptySHA3 && m_db.lookup(r[3].toHash<h256>()).empty())
-					return false;
-			}*/
+			size_t size = code(_a).size();
+			codeSizeCache.store(codeHash, size);
+			return size;
 		}
-		catch (InvalidTrie const&)
-		{
-			cwarn << "BAD TRIE" << (e ? "[enforced" : "[unenforced") << "refs]";
-			cnote << m_db.keys();
-			m_state.debugStructure(cerr);
-			return false;
-		}
-	return true;
+	}
+	else
+		return 0;
 }
 
-std::pair<ExecutionResult, TransactionReceipt> State::execute(EnvInfo const& _envInfo, SealEngineFace* _sealEngine, Transaction const& _t, Permanence _p, OnOpFunc const& _onOp)
+size_t State::savepoint() const
+{
+	return m_changeLog.size();
+}
+
+void State::rollback(size_t _savepoint)
+{
+	while (_savepoint != m_changeLog.size())
+	{
+		auto& change = m_changeLog.back();
+		auto& account = m_cache[change.address];
+
+		// Public State API cannot be used here because it will add another
+		// change log entry.
+		switch (change.kind)
+		{
+		case Change::Storage:
+			account.setStorage(change.key, change.value);
+			break;
+		case Change::StorageRoot:
+			account.setStorageRoot(change.value);
+			break;
+		case Change::Balance:
+			account.addBalance(0 - change.value);
+			break;
+		case Change::Nonce:
+			account.setNonce(change.value);
+			break;
+		case Change::Create:
+			m_cache.erase(change.address);
+			break;
+		case Change::Code:
+			account.setCode(std::move(change.oldCode));
+			break;
+		case Change::Touch:
+			account.untouch();
+			m_unchangedCacheEntries.emplace_back(change.address);
+			break;
+		}
+		m_changeLog.pop_back();
+	}
+}
+
+std::pair<ExecutionResult, TransactionReceipt> State::execute(EnvInfo const& _envInfo, SealEngineFace const& _sealEngine, Transaction const& _t, Permanence _p, OnOpFunc const& _onOp)
 {
 	auto onOp = _onOp;
 #if ETH_VMTRACE
@@ -471,60 +553,47 @@ std::pair<ExecutionResult, TransactionReceipt> State::execute(EnvInfo const& _en
 		onOp = Executive::simpleTrace(); // override tracer
 #endif
 
-#if ETH_PARANOIA
-	paranoia("start of execution.", true);
-	State old(*this);
-	auto h = rootHash();
-#endif
-
 	// Create and initialize the executive. This will throw fairly cheaply and quickly if the
 	// transaction is bad in any way.
 	Executive e(*this, _envInfo, _sealEngine);
 	ExecutionResult res;
 	e.setResultRecipient(res);
-	e.initialize(_t);
 
-	// OK - transaction looks valid - execute.
-	u256 startGasUsed = _envInfo.gasUsed();
-#if ETH_PARANOIA
-	ctrace << "Executing" << e.t() << "on" << h;
-	ctrace << toHex(e.t().rlp());
-#endif
-	if (!e.execute())
-		e.go(onOp);
-	e.finalize();
+	u256 const startGasUsed = _envInfo.gasUsed();
+	bool const statusCode = executeTransaction(e, _t, onOp);
 
-#if ETH_PARANOIA
-	ctrace << "Ready for commit;";
-	ctrace << old.diff(*this);
-#endif
-
-	if (_p == Permanence::Reverted)
-		m_cache.clear();
-	else
+	bool removeEmptyAccounts = false;
+	switch (_p)
 	{
-		commit();
-
-#if ETH_PARANOIA && !ETH_FATDB
-		ctrace << "Executed; now" << rootHash();
-		ctrace << old.diff(*this);
-
-		paranoia("after execution commit.", true);
-
-		if (e.t().receiveAddress())
-		{
-			EnforceRefs r(m_db, true);
-			if (storageRoot(e.t().receiveAddress()) && m_db.lookup(storageRoot(e.t().receiveAddress())).empty())
-			{
-				cwarn << "TRIE immediately after execution; no node for receiveAddress";
-				BOOST_THROW_EXCEPTION(InvalidTrie());
-			}
-		}
-#endif
-		// TODO: CHECK TRIE after level DB flush to make sure exactly the same.
+		case Permanence::Reverted:
+			m_cache.clear();
+			break;
+		case Permanence::Committed:
+			removeEmptyAccounts = _envInfo.number() >= _sealEngine.chainParams().EIP158ForkBlock;
+			commit(removeEmptyAccounts ? State::CommitBehaviour::RemoveEmptyAccounts : State::CommitBehaviour::KeepEmptyAccounts);
+			break;
+		case Permanence::Uncommitted:
+			break;
 	}
 
-	return make_pair(res, TransactionReceipt(rootHash(), startGasUsed + e.gasUsed(), e.logs()));
+	TransactionReceipt const receipt = _envInfo.number() >= _sealEngine.chainParams().byzantiumForkBlock ?
+		TransactionReceipt(statusCode, startGasUsed + e.gasUsed(), e.logs()) :
+		TransactionReceipt(rootHash(), startGasUsed + e.gasUsed(), e.logs());
+	return make_pair(res, receipt);
+}
+
+void State::executeBlockTransactions(Block const& _block, unsigned _txCount, LastBlockHashesFace const& _lastHashes, SealEngineFace const& _sealEngine)
+{
+	u256 gasUsed = 0;
+	for (unsigned i = 0; i < _txCount; ++i)
+	{
+		EnvInfo envInfo(_block.info(), _lastHashes, gasUsed);
+
+		Executive e(*this, envInfo, _sealEngine);
+		executeTransaction(e, _block.pending()[i], OnOpFunc());
+
+		gasUsed += e.gasUsed();
+	}
 }
 
 std::ostream& dev::eth::operator<<(std::ostream& _out, State const& _s)
@@ -556,7 +625,7 @@ std::ostream& dev::eth::operator<<(std::ostream& _out, State const& _s)
 
 			stringstream contout;
 
-			if ((cache && cache->codeBearing()) || (!cache && r && (h256)r[3] != EmptySHA3))
+			if ((cache && cache->codeHash() == EmptySHA3) || (!cache && r && (h256)r[3] != EmptySHA3))
 			{
 				std::map<u256, u256> mem;
 				std::set<u256> back;
@@ -584,7 +653,7 @@ std::ostream& dev::eth::operator<<(std::ostream& _out, State const& _s)
 					contout << "???";
 				else
 					contout << r[2].toHash<h256>();
-				if (cache && cache->isFreshCode())
+				if (cache && cache->hasNewCode())
 					contout << " $" << toHex(cache->code());
 				else
 					contout << " $" << (cache ? cache->codeHash() : r[3].toHash<h256>());
@@ -603,38 +672,69 @@ std::ostream& dev::eth::operator<<(std::ostream& _out, State const& _s)
 	return _out;
 }
 
-#if ETH_FATDB
-static std::string minHex(h256 const& _h)
+State& dev::eth::createIntermediateState(State& o_s, Block const& _block, unsigned _txIndex, BlockChain const& _bc)
 {
-	unsigned i = 0;
-	for (; i < 31 && !_h[i]; ++i) {}
-	return toHex(_h.ref().cropped(i));
-}
-#endif
-
-void State::streamJSON(ostream& _f) const
-{
-	_f << "{" << endl;
-#if ETH_FATDB
-	int fi = 0;
-	for (pair<Address, u256> const& i: addresses())
+	o_s = _block.state();
+	u256 const rootHash = _block.stateRootBeforeTx(_txIndex);
+	if (rootHash)
+		o_s.setRoot(rootHash);
+	else
 	{
-		_f << (fi++ ? "," : "") << "\"" << i.first.hex() << "\": { ";
-		_f << "\"balance\": \"" << toString(i.second) << "\", ";
-		if (codeHash(i.first) != EmptySHA3)
-		{
-			_f << "\"codeHash\": \"" << codeHash(i.first).hex() << "\", ";
-			_f << "\"storage\": {";
-			int fj = 0;
-			for (pair<u256, u256> const& j: storage(i.first))
-				_f << (fj++ ? "," : "") << "\"" << minHex(j.first) << "\":\"" << minHex(j.second) << "\"";
-			_f << "}, ";
-		}
-		_f << "\"nonce\": \"" << toString(transactionsFrom(i.first)) << "\"";
-		_f << "}" << endl;	// end account
-		if (!(fi % 100))
-			_f << flush;
+		o_s.setRoot(_block.stateRootBeforeTx(0));
+		o_s.executeBlockTransactions(_block, _txIndex, _bc.lastBlockHashes(), *_bc.sealEngine());
 	}
-#endif
-	_f << "}";
+	return o_s;
 }
+
+template <class DB>
+AddressHash dev::eth::commit(AccountMap const& _cache, SecureTrieDB<Address, DB>& _state)
+{
+	AddressHash ret;
+	for (auto const& i: _cache)
+		if (i.second.isDirty())
+		{
+			if (!i.second.isAlive())
+				_state.remove(i.first);
+			else
+			{
+				RLPStream s(4);
+				s << i.second.nonce() << i.second.balance();
+
+				if (i.second.storageOverlay().empty())
+				{
+					assert(i.second.baseRoot());
+					s.append(i.second.baseRoot());
+				}
+				else
+				{
+					SecureTrieDB<h256, DB> storageDB(_state.db(), i.second.baseRoot());
+					for (auto const& j: i.second.storageOverlay())
+						if (j.second)
+							storageDB.insert(j.first, rlp(j.second));
+						else
+							storageDB.remove(j.first);
+					assert(storageDB.root());
+					s.append(storageDB.root());
+				}
+
+				if (i.second.hasNewCode())
+				{
+					h256 ch = i.second.codeHash();
+					// Store the size of the code
+					CodeSizeCache::instance().store(ch, i.second.code().size());
+					_state.db()->insert(ch, &i.second.code());
+					s << ch;
+				}
+				else
+					s << i.second.codeHash();
+
+				_state.insert(i.first, &s.out());
+			}
+			ret.insert(i.first);
+		}
+	return ret;
+}
+
+
+template AddressHash dev::eth::commit<OverlayDB>(AccountMap const& _cache, SecureTrieDB<Address, OverlayDB>& _state);
+template AddressHash dev::eth::commit<MemoryDB>(AccountMap const& _cache, SecureTrieDB<Address, MemoryDB>& _state);

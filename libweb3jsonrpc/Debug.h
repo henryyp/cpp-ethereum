@@ -8,6 +8,8 @@ namespace dev
 namespace eth
 {
 class Client;
+
+StandardTrace::DebugOptions debugOptions(Json::Value const& _json);
 }
 
 namespace rpc
@@ -30,7 +32,8 @@ public:
 	virtual Json::Value debug_traceCall(Json::Value const& _call, std::string const& _blockNumber, Json::Value const& _options) override;
 	virtual Json::Value debug_traceBlockByNumber(int _blockNumber, Json::Value const& _json) override;
 	virtual Json::Value debug_traceBlockByHash(std::string const& _blockHash, Json::Value const& _json) override;
-	virtual Json::Value debug_storageAt(std::string const& _blockHashOrNumber, int _txIndex, std::string const& _address) override;
+	virtual Json::Value debug_storageRangeAt(std::string const& _blockHashOrNumber, int _txIndex, std::string const& _address, std::string const& _begin, int _maxResults) override;
+	virtual std::string debug_preimage(std::string const& _hashedKey) override;
 	virtual Json::Value debug_traceBlock(std::string const& _blockRlp, Json::Value const& _json);
 
 private:

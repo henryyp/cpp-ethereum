@@ -35,8 +35,8 @@ void VM::reportStackUse()
 std::array<InstructionMetric, 256> VM::c_metrics;
 void VM::initMetrics()
 {
-	static bool done=false;
-	if (!done)
+	static bool done =
+	[]()
 	{
 		for (unsigned i = 0; i < 256; ++i)
 		{
@@ -45,144 +45,187 @@ void VM::initMetrics()
 			c_metrics[i].args = op.args;
 			c_metrics[i].ret = op.ret;
 		}
-	}
-	done = true;
+		return true;
+	} ();
+	(void)done;
 }
 
-/// Init interpreter on entry.
-void VM::initEntry()
+void VM::copyCode(int _extraBytes)
 {
-	m_bounce = &VM::interpretCases;
-
-	// Copy and extend code by 32 zero bytes to allow reading virtual push data
-	// at the end of the code without bounds checks.
-	auto extendedSize = m_ext->code.size() + 32;
-	m_codeSpace.reserve(extendedSize);
-	m_codeSpace = m_ext->code;
-	m_codeSpace.resize(extendedSize);
-	m_code = m_codeSpace.data();
-
-	interpretCases(); // first time initializes
-
-	initMetrics();
-
-	optimize();
-}
-
-int VM::poolConstant(const u256& _con)
-{
-	int i = 0, n = m_poolSpace.size();
-	while (i < n)
-	{
-		if (m_poolSpace[i] == _con)
-			return i;
-	}
-	if (i <= 255 )
-	{
-		m_poolSpace.push_back(_con);
-		return i;
-	}
-	return -1;
+	// Copy code so that it can be safely modified and extend code by
+	// _extraBytes zero bytes to allow reading virtual data at the end
+	// of the code without bounds checks.
+	auto extendedSize = m_ext->code.size() + _extraBytes;
+	m_code.reserve(extendedSize);
+	m_code = m_ext->code;
+	m_code.resize(extendedSize);
 }
 
 void VM::optimize()
 {
-	size_t nBytes = m_codeSpace.size();
-	
+	copyCode(33);
+
+	size_t const nBytes = m_ext->code.size();
+
 	// build a table of jump destinations for use in verifyJumpDest
-	for (size_t i = 0; i < nBytes; ++i)
+	
+	TRACE_STR(1, "Build JUMPDEST table")
+	for (size_t pc = 0; pc < nBytes; ++pc)
 	{
-		Instruction op = Instruction(m_code[i]);
-		TRACE_OP(2, i, op);
+		Instruction op = Instruction(m_code[pc]);
+		TRACE_OP(2, pc, op);
 				
 		// make synthetic ops in user code trigger invalid instruction if run
-		if (op == Instruction::PUSHC ||
-		    op == Instruction::JUMPV ||
-		    op == Instruction::JUMPVI)
+		if (
+			op == Instruction::PUSHC ||
+			op == Instruction::JUMPC ||
+			op == Instruction::JUMPCI
+		)
 		{
-			m_code[i] = (byte)Instruction::BAD;
+			TRACE_OP(1, pc, op);
+			m_code[pc] = (byte)Instruction::INVALID;
 		}
 
 		if (op == Instruction::JUMPDEST)
 		{
-			TRACE_OP(1, i, op);
-			m_jumpDests.push_back(i);
+			m_jumpDests.push_back(pc);
 		}
-		else if ((byte)Instruction::PUSH1 <= (byte)op &&
-		         (byte)op <= (byte)Instruction::PUSH32)
+		else if (
+			(byte)Instruction::PUSH1 <= (byte)op &&
+			(byte)op <= (byte)Instruction::PUSH32
+		)
 		{
-			i += (byte)op - (byte)Instruction::PUSH1 + 1;
+			pc += (byte)op - (byte)Instruction::PUSH1 + 1;
 		}
-		
+#if EIP_615
+		else if (
+			op == Instruction::JUMPTO ||
+			op == Instruction::JUMPIF ||
+			op == Instruction::JUMPSUB)
+		{
+			++pc;
+			pc += 4;
+		}
+		else if (op == Instruction::JUMPV || op == Instruction::JUMPSUBV)
+		{
+			++pc;
+			pc += 4 * m_code[pc];  // number of 4-byte dests followed by table
+		}
+		else if (op == Instruction::BEGINSUB)
+		{
+			m_beginSubs.push_back(pc);
+		}
+		else if (op == Instruction::BEGINDATA)
+		{
+			break;
+		}
+#endif
 	}
-
+	
 #ifdef EVM_DO_FIRST_PASS_OPTIMIZATION
-
-	for (size_t i = 0; i < nBytes; ++i)
+	
+	TRACE_STR(1, "Do first pass optimizations")
+	for (size_t pc = 0; pc < nBytes; ++pc)
 	{
-		Instruction op = Instruction(m_code[i]);
+		u256 val = 0;
+		Instruction op = Instruction(m_code[pc]);
 
 		if ((byte)Instruction::PUSH1 <= (byte)op && (byte)op <= (byte)Instruction::PUSH32)
 		{
-			byte n = (byte)op - (byte)Instruction::PUSH1 + 1;
+			byte nPush = (byte)op - (byte)Instruction::PUSH1 + 1;
 
 			// decode pushed bytes to integral value
-			u256 val = m_code[i+1];
-			for (uint64_t j = i+2, m = n; --m; ++j)
-				val = (val << 8) | m_code[j];
-
-		#ifdef EVM_USE_CONSTANT_POOL
-			TRACE_PRE_OPT(1, i, op);
-	
-			// add value to constant pool and replace PUSHn with PUSHC if room
-			if (1 < n)
-			{
-				int pool_off = poolConstant(val);
-				if (0 <= pool_off && pool_off < 256)
-				{
-					m_code[i] = byte(op = Instruction::PUSHC);
-					m_code[i+1] = (byte)pool_off;
-					m_code[i+2] = n;
-				}
+			val = m_code[pc+1];
+			for (uint64_t i = pc+2, n = nPush; --n; ++i) {
+				val = (val << 8) | m_code[i];
 			}
-			
-			TRACE_POST_OPT(1, i, op);
+
+		#if EVM_USE_CONSTANT_POOL
+
+			// add value to constant pool and replace PUSHn with PUSHC
+			// place offset in code as 2 bytes MSB-first
+			// followed by one byte count of remaining pushed bytes
+			if (5 < nPush)
+			{
+				uint16_t pool_off = m_pool.size();
+				TRACE_VAL(1, "stash", val);
+				TRACE_VAL(1, "... in pool at offset" , pool_off);
+				m_pool.push_back(val);
+
+				TRACE_PRE_OPT(1, pc, op);
+				m_code[pc] = byte(op = Instruction::PUSHC);
+				m_code[pc+3] = nPush - 2;
+				m_code[pc+2] = pool_off & 0xff;
+				m_code[pc+1] = pool_off >> 8;
+				TRACE_POST_OPT(1, pc, op);
+			}
+
 		#endif
 
-		#ifdef EVM_REPLACE_CONST_JUMP	
-			// replace JUMP or JUMPI to constant location with JUMPV or JUMPVI
+		#if EVM_REPLACE_CONST_JUMP	
+			// replace JUMP or JUMPI to constant location with JUMPC or JUMPCI
 			// verifyJumpDest is M = log(number of jump destinations)
 			// outer loop is N = number of bytes in code array
 			// so complexity is N log M, worst case is N log N
-			size_t ii = i + n + 1;
-			op = Instruction(m_code[ii]);
+			size_t i = pc + nPush + 1;
+			op = Instruction(m_code[i]);
 			if (op == Instruction::JUMP)
 			{
-				TRACE_PRE_OPT(1, ii, op);
+				TRACE_VAL(1, "Replace const JUMP with JUMPC to", val)
+				TRACE_PRE_OPT(1, i, op);
 				
 				if (0 <= verifyJumpDest(val, false))
-					m_code[ii] = byte(op = Instruction::JUMPV);
+					m_code[i] = byte(op = Instruction::JUMPC);
 				
-				TRACE_POST_OPT(1, ii, op);
+				TRACE_POST_OPT(1, i, op);
 			}
 			else if (op == Instruction::JUMPI)
 			{
-				TRACE_PRE_OPT(1, ii, op);
+				TRACE_VAL(1, "Replace const JUMPI with JUMPCI to", val)
+				TRACE_PRE_OPT(1, i, op);
 				
 				if (0 <= verifyJumpDest(val, false))
-					m_code[ii] = byte(op = Instruction::JUMPVI);
+					m_code[i] = byte(op = Instruction::JUMPCI);
 				
-				TRACE_POST_OPT(1, ii, op);
+				TRACE_POST_OPT(1, i, op);
 			}
-
 		#endif
-			
-			i += n;
+
+			pc += nPush;
 		}
-		
-	}	
-#endif
-	
-	m_pool = m_poolSpace.data();
-	
+	}
+	TRACE_STR(1, "Finished optimizations")
+#endif	
+}
+
+
+//
+// Init interpreter on entry.
+//
+void VM::initEntry()
+{
+	m_bounce = &VM::interpretCases; 	
+	initMetrics();
+	optimize();
+}
+
+
+// Implementation of EXP.
+//
+// This implements exponentiation by squaring algorithm.
+// Is faster than boost::multiprecision::powm() because it avoids explicit
+// mod operation.
+// Do not inline it.
+u256 VM::exp256(u256 _base, u256 _exponent)
+{
+	using boost::multiprecision::limb_type;
+	u256 result = 1;
+	while (_exponent)
+	{
+		if (static_cast<limb_type>(_exponent) & 1)	// If exponent is odd.
+			result *= _base;
+		_base *= _base;
+		_exponent >>= 1;
+	}
+	return result;
 }

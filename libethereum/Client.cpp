@@ -29,13 +29,15 @@
 #include "Defaults.h"
 #include "Executive.h"
 #include "EthereumHost.h"
-#include "Utility.h"
 #include "Block.h"
 #include "TransactionQueue.h"
 using namespace std;
 using namespace dev;
 using namespace dev::eth;
 using namespace p2p;
+namespace fs = boost::filesystem;
+
+static_assert(BOOST_VERSION >= 106400, "Wrong boost headers version");
 
 std::ostream& dev::eth::operator<<(std::ostream& _out, ActivityReport const& _r)
 {
@@ -61,13 +63,14 @@ Client::Client(
 	int _networkID,
 	p2p::Host* _host,
 	std::shared_ptr<GasPricer> _gpForAdoption,
-	std::string const& _dbPath,
+	fs::path const& _dbPath,
 	WithExisting _forceAction,
 	TransactionQueue::Limits const& _l
 ):
-	ClientBase(_l),
+	ClientBase(),
 	Worker("eth", 0),
 	m_bc(_params, _dbPath, _forceAction, [](unsigned d, unsigned t){ std::cerr << "REVISING BLOCKCHAIN: Processed " << d << " of " << t << "...\r"; }),
+	m_tq(_l),
 	m_gp(_gpForAdoption ? _gpForAdoption : make_shared<TrivialGasPricer>()),
 	m_preSeal(chainParams().accountStartNonce),
 	m_postSeal(chainParams().accountStartNonce),
@@ -79,9 +82,10 @@ Client::Client(
 Client::~Client()
 {
 	stopWorking();
+	terminate();
 }
 
-void Client::init(p2p::Host* _extNet, std::string const& _dbPath, WithExisting _forceAction, u256 _networkId)
+void Client::init(p2p::Host* _extNet, fs::path const& _dbPath, WithExisting _forceAction, u256 _networkId)
 {
 	DEV_TIMED_FUNCTION_ABOVE(500);
 
@@ -101,6 +105,10 @@ void Client::init(p2p::Host* _extNet, std::string const& _dbPath, WithExisting _
 	m_bqReady = m_bq.onReady([=](){ this->onBlockQueueReady(); });			// TODO: should read m_bq->onReady(thisThread, syncBlockQueue);
 	m_bq.setOnBad([=](Exception& ex){ this->onBadBlock(ex); });
 	bc().setOnBad([=](Exception& ex){ this->onBadBlock(ex); });
+	bc().setOnBlockImport([=](BlockHeader const& _info){
+		if (auto h = m_host.lock())
+			h->onBlockImported(_info);
+	});
 
 	if (_forceAction == WithExisting::Rescue)
 		bc().rescue(m_stateDB);
@@ -109,12 +117,13 @@ void Client::init(p2p::Host* _extNet, std::string const& _dbPath, WithExisting _
 
 	auto host = _extNet->registerCapability(make_shared<EthereumHost>(bc(), m_stateDB, m_tq, m_bq, _networkId));
 	m_host = host;
+
 	_extNet->addCapability(host, EthereumHost::staticName(), EthereumHost::c_oldProtocolVersion); //TODO: remove this once v61+ protocol is common
+
 
 	if (_dbPath.size())
 		Defaults::setDBPath(_dbPath);
 	doWork(false);
-	startWorking();
 }
 
 ImportResult Client::queueBlock(bytes const& _block, bool _isSafe)
@@ -137,7 +146,7 @@ void Client::onBadBlock(Exception& _ex) const
 	if (!block)
 	{
 		cwarn << "ODD: onBadBlock called but exception (" << _ex.what() << ") has no block in it.";
-		cwarn << boost::diagnostic_information(_ex, true);
+		cwarn << boost::diagnostic_information(_ex);
 		return;
 	}
 
@@ -187,7 +196,7 @@ bool Client::isMajorSyncing() const
 	if (auto h = m_host.lock())
 	{
 		SyncState state = h->status().state;
-		return (state != SyncState::Idle && state != SyncState::NewBlocks) || h->bq().items().first > 10;
+		return state != SyncState::Idle || h->bq().items().first > 10;
 	}
 	return false;
 }
@@ -359,29 +368,6 @@ void Client::appendFromBlock(h256 const& _block, BlockPolarity _polarity, h256Ha
 	}
 }
 
-ExecutionResult Client::call(Address _dest, bytes const& _data, u256 _gas, u256 _value, u256 _gasPrice, Address const& _from)
-{
-	ExecutionResult ret;
-	try
-	{
-		Block temp(chainParams().accountStartNonce);
-		clog(ClientDetail) << "Nonce at " << _dest << " pre:" << m_preSeal.transactionsFrom(_dest) << " post:" << m_postSeal.transactionsFrom(_dest);
-		DEV_READ_GUARDED(x_postSeal)
-			temp = m_postSeal;
-		temp.mutableState().addBalance(_from, _value + _gasPrice * _gas);
-		Executive e(temp);
-		e.setResultRecipient(ret);
-		if (!e.call(_dest, _from, _value, _gasPrice, &_data, _gas))
-			e.go();
-		e.finalize();
-	}
-	catch (...)
-	{
-		cwarn << "Client::call failed: " << boost::current_exception_diagnostic_information();
-	}
-	return ret;
-}
-
 unsigned static const c_syncMin = 1;
 unsigned static const c_syncMax = 1000;
 double static const c_targetDuration = 1;
@@ -412,6 +398,8 @@ void Client::syncBlockQueue()
 
 void Client::syncTransactionQueue()
 {
+	resyncStateFromChain();
+
 	Timer timer;
 
 	h256Hash changeds;
@@ -489,46 +477,45 @@ void Client::onNewBlocks(h256s const& _blocks, h256Hash& io_changed)
 
 void Client::resyncStateFromChain()
 {
+	DEV_READ_GUARDED(x_working)
+		if (bc().currentHash() == m_working.info().parentHash())
+			return;
+		
 	// RESTART MINING
 
-//	ctrace << "resyncStateFromChain()";
+	bool preChanged = false;
+	Block newPreMine(chainParams().accountStartNonce);
+	DEV_READ_GUARDED(x_preSeal)
+		newPreMine = m_preSeal;
 
-	if (!isMajorSyncing())
+	// TODO: use m_postSeal to avoid re-evaluating our own blocks.
+	preChanged = newPreMine.sync(bc());
+
+	if (preChanged || m_postSeal.author() != m_preSeal.author())
 	{
-		bool preChanged = false;
-		Block newPreMine(chainParams().accountStartNonce);
-		DEV_READ_GUARDED(x_preSeal)
-			newPreMine = m_preSeal;
-
-		// TODO: use m_postSeal to avoid re-evaluating our own blocks.
-		preChanged = newPreMine.sync(bc());
-
-		if (preChanged || m_postSeal.author() != m_preSeal.author())
-		{
-			DEV_WRITE_GUARDED(x_preSeal)
-				m_preSeal = newPreMine;
-			DEV_WRITE_GUARDED(x_working)
-				m_working = newPreMine;
-			DEV_READ_GUARDED(x_postSeal)
-				if (!m_postSeal.isSealed() || m_postSeal.info().hash() != newPreMine.info().parentHash())
-					for (auto const& t: m_postSeal.pending())
-					{
-						clog(ClientTrace) << "Resubmitting post-seal transaction " << t;
+		DEV_WRITE_GUARDED(x_preSeal)
+			m_preSeal = newPreMine;
+		DEV_WRITE_GUARDED(x_working)
+			m_working = newPreMine;
+		DEV_READ_GUARDED(x_postSeal)
+			if (!m_postSeal.isSealed() || m_postSeal.info().hash() != newPreMine.info().parentHash())
+				for (auto const& t: m_postSeal.pending())
+				{
+					clog(ClientTrace) << "Resubmitting post-seal transaction " << t;
 //						ctrace << "Resubmitting post-seal transaction " << t;
-						auto ir = m_tq.import(t, IfDropped::Retry);
-						if (ir != ImportResult::Success)
-							onTransactionQueueReady();
-					}
-			DEV_READ_GUARDED(x_working) DEV_WRITE_GUARDED(x_postSeal)
-				m_postSeal = m_working;
+					auto ir = m_tq.import(t, IfDropped::Retry);
+					if (ir != ImportResult::Success)
+						onTransactionQueueReady();
+				}
+		DEV_READ_GUARDED(x_working) DEV_WRITE_GUARDED(x_postSeal)
+			m_postSeal = m_working;
 
-			onPostStateChanged();
-		}
-
-		// Quick hack for now - the TQ at this point already has the prior pending transactions in it;
-		// we should resync with it manually until we are stricter about what constitutes "knowing".
-		onTransactionQueueReady();
+		onPostStateChanged();
 	}
+
+	// Quick hack for now - the TQ at this point already has the prior pending transactions in it;
+	// we should resync with it manually until we are stricter about what constitutes "knowing".
+	onTransactionQueueReady();
 }
 
 void Client::resetState()
@@ -557,7 +544,8 @@ void Client::onChainChanged(ImportRoute const& _ir)
 		m_tq.dropGood(t);
 	}
 	onNewBlocks(_ir.liveBlocks, changeds);
-	resyncStateFromChain();
+	if (!isMajorSyncing())
+		resyncStateFromChain();
 	noteChanged(changeds);
 }
 
@@ -670,10 +658,10 @@ void Client::doWork(bool _doWait)
 	}
 
 	t = true;
-	bool isSealed;
+	bool isSealed = false;
 	DEV_READ_GUARDED(x_working)
 		isSealed = m_working.isSealed();
-	if (!isSealed && !isSyncing() && !m_remoteWorking && m_syncTransactionQueue.compare_exchange_strong(t, false))
+	if (!isSealed && !isMajorSyncing() && !m_remoteWorking && m_syncTransactionQueue.compare_exchange_strong(t, false))
 		syncTransactionQueue();
 
 	tick();
@@ -768,28 +756,6 @@ Block Client::block(h256 const& _blockHash, PopulationStatistics* o_stats) const
 	}
 }
 
-State Client::state(unsigned _txi, h256 const& _blockHash) const
-{
-	try
-	{
-		return block(_blockHash).fromPending(_txi);
-	}
-	catch (Exception& ex)
-	{
-		ex << errinfo_block(bc().block(_blockHash));
-		onBadBlock(ex);
-		return State(chainParams().accountStartNonce);
-	}
-}
-
-eth::State Client::state(unsigned _txi) const
-{
-	DEV_READ_GUARDED(x_postSeal)
-		return m_postSeal.fromPending(_txi);
-	assert(false);
-	return State(chainParams().accountStartNonce);
-}
-
 void Client::flushTransactions()
 {
 	doWork();
@@ -843,4 +809,46 @@ void Client::rewind(unsigned _n)
 	auto h = m_host.lock();
 	if (h)
 		h->reset();
+}
+
+pair<h256, Address> Client::submitTransaction(TransactionSkeleton const& _t, Secret const& _secret)
+{
+	prepareForTransaction();
+
+	TransactionSkeleton ts(_t);
+	ts.from = toAddress(_secret);
+	if (_t.nonce == Invalid256)
+		ts.nonce = max<u256>(postSeal().transactionsFrom(ts.from), m_tq.maxNonce(ts.from));
+	if (ts.gasPrice == Invalid256)
+		ts.gasPrice = gasBidPrice();
+	if (ts.gas == Invalid256)
+		ts.gas = min<u256>(gasLimitRemaining() / 5, balanceAt(ts.from) / ts.gasPrice);
+
+	Transaction t(ts, _secret);
+	m_tq.import(t.rlp());
+
+	return make_pair(t.sha3(), toAddress(ts.from, ts.nonce));
+}
+
+// TODO: remove try/catch, allow exceptions
+ExecutionResult Client::call(Address const& _from, u256 _value, Address _dest, bytes const& _data, u256 _gas, u256 _gasPrice, BlockNumber _blockNumber, FudgeFactor _ff)
+{
+	ExecutionResult ret;
+	try
+	{
+		Block temp = block(_blockNumber);
+		u256 nonce = max<u256>(temp.transactionsFrom(_from), m_tq.maxNonce(_from));
+		u256 gas = _gas == Invalid256 ? gasLimitRemaining() : _gas;
+		u256 gasPrice = _gasPrice == Invalid256 ? gasBidPrice() : _gasPrice;
+		Transaction t(_value, gasPrice, gas, _dest, _data, nonce);
+		t.forceSender(_from);
+		if (_ff == FudgeFactor::Lenient)
+			temp.mutableState().addBalance(_from, (u256)(t.gas() * t.gasPrice() + t.value()));
+		ret = temp.execute(bc().lastBlockHashes(), t, Permanence::Reverted);
+	}
+	catch (...)
+	{
+		// TODO: Some sort of notification of failure.
+	}
+	return ret;
 }

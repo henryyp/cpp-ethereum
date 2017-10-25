@@ -20,29 +20,25 @@
  */
 
 #include "WebThree.h"
-#include <chrono>
-#include <thread>
 #include <boost/filesystem.hpp>
 #include <boost/algorithm/string.hpp>
-#include <libdevcore/Log.h>
 #include <libethereum/Defaults.h>
 #include <libethereum/EthereumHost.h>
-#include <libwhisper/WhisperHost.h>
 #include <libethereum/ClientTest.h>
 #include <libethashseal/EthashClient.h>
-#include "cpp-ethereum/BuildInfo.h"
+#include "BuildInfo.h"
 #include <libethashseal/Ethash.h>
-#include "Swarm.h"
-#include "Support.h"
 using namespace std;
 using namespace dev;
 using namespace dev::p2p;
 using namespace dev::eth;
 using namespace dev::shh;
 
+static_assert(BOOST_VERSION >= 106400, "Wrong boost headers version");
+
 WebThreeDirect::WebThreeDirect(
 	std::string const& _clientVersion,
-	std::string const& _dbPath,
+	boost::filesystem::path const& _dbPath,
 	eth::ChainParams const& _params,
 	WithExisting _we,
 	std::set<std::string> const& _interfaces,
@@ -60,11 +56,12 @@ WebThreeDirect::WebThreeDirect(
 		Ethash::init();
 		NoProof::init();
 		if (_params.sealEngineName == "Ethash")
-			m_ethereum.reset(new eth::EthashClient(_params, (int)_params.u256Param("networkID"), &m_net, shared_ptr<GasPricer>(), _dbPath, _we));
+			m_ethereum.reset(new eth::EthashClient(_params, (int)_params.networkID, &m_net, shared_ptr<GasPricer>(), _dbPath, _we));
 		else if (_params.sealEngineName == "NoProof" && _testing)
-			m_ethereum.reset(new eth::ClientTest(_params, (int)_params.u256Param("networkID"), &m_net, shared_ptr<GasPricer>(), _dbPath, _we));
+			m_ethereum.reset(new eth::ClientTest(_params, (int)_params.networkID, &m_net, shared_ptr<GasPricer>(), _dbPath, _we));
 		else
-			m_ethereum.reset(new eth::Client(_params, (int)_params.u256Param("networkID"), &m_net, shared_ptr<GasPricer>(), _dbPath, _we));
+			m_ethereum.reset(new eth::Client(_params, (int)_params.networkID, &m_net, shared_ptr<GasPricer>(), _dbPath, _we));
+		m_ethereum->startWorking();
 		string bp = DEV_QUOTED(ETH_BUILD_PLATFORM);
 		vector<string> bps;
 		boost::split(bps, bp, boost::is_any_of("/"));
@@ -76,13 +73,6 @@ WebThreeDirect::WebThreeDirect(
 
 	if (_interfaces.count("shh"))
 		m_whisper = m_net.registerCapability(make_shared<WhisperHost>());
-
-	if (_interfaces.count("bzz"))
-	{
-		m_swarm.reset(new bzz::Client(this));
-	}
-
-	m_support = make_shared<Support>(this);
 }
 
 WebThreeDirect::~WebThreeDirect()
@@ -99,13 +89,6 @@ WebThreeDirect::~WebThreeDirect()
 	// use bits of data owned by m_ethereum).
 	m_net.stop();
 	m_ethereum.reset();
-}
-
-bzz::Interface* WebThreeDirect::swarm() const
-{
-	if (!m_swarm)
-		BOOST_THROW_EXCEPTION(InterfaceNotSupported("bzz"));
-	return m_swarm.get();
 }
 
 std::string WebThreeDirect::composeClientVersion(std::string const& _client)

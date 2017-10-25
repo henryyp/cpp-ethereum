@@ -27,6 +27,7 @@
 #include <libevm/ExtVMFace.h>
 #include <libethcore/SealEngine.h>
 #include "State.h"
+#include "Executive.h"
 
 namespace dev
 {
@@ -42,64 +43,60 @@ class ExtVM: public ExtVMFace
 {
 public:
 	/// Full constructor.
-	ExtVM(State& _s, EnvInfo const& _envInfo, SealEngineFace* _sealEngine, Address _myAddress, Address _caller, Address _origin, u256 _value, u256 _gasPrice, bytesConstRef _data, bytesConstRef _code, h256 const& _codeHash, unsigned _depth = 0):
-		ExtVMFace(_envInfo, _myAddress, _caller, _origin, _value, _gasPrice, _data, _code.toBytes(), _codeHash, _depth), m_s(_s), m_origCache(_s.m_cache), m_sealEngine(_sealEngine)
+	ExtVM(State& _s, EnvInfo const& _envInfo, SealEngineFace const& _sealEngine, Address _myAddress, Address _caller, Address _origin, u256 _value, u256 _gasPrice, bytesConstRef _data, bytesConstRef _code, h256 const& _codeHash, unsigned _depth = 0, bool _staticCall = false):
+		ExtVMFace(_envInfo, _myAddress, _caller, _origin, _value, _gasPrice, _data, _code.toBytes(), _codeHash, _depth, _staticCall), m_s(_s), m_sealEngine(_sealEngine)
 	{
-		m_s.ensureCached(_myAddress, true, true);
+		// Contract: processing account must exist. In case of CALL, the ExtVM
+		// is created only if an account has code (so exist). In case of CREATE
+		// the account must be created first.
+		assert(m_s.addressInUse(_myAddress));
 	}
 
 	/// Read storage location.
 	virtual u256 store(u256 _n) override final { return m_s.storage(myAddress, _n); }
 
 	/// Write a value in storage.
-	virtual void setStore(u256 _n, u256 _v) override final { m_s.setStorage(myAddress, _n, _v); }
+	virtual void setStore(u256 _n, u256 _v) override final;
 
 	/// Read address's code.
 	virtual bytes const& codeAt(Address _a) override final { return m_s.code(_a); }
 
+	/// @returns the size of the code in  bytes at the given address.
+	virtual size_t codeSizeAt(Address _a) override final;
+
 	/// Create a new contract.
-	virtual h160 create(u256 _endowment, u256& io_gas, bytesConstRef _code, OnOpFunc const& _onOp = {}) override final;
+	virtual std::pair<h160, owning_bytes_ref> create(u256 _endowment, u256& io_gas, bytesConstRef _code, Instruction _op, u256 _salt, OnOpFunc const& _onOp = {}) override final;
 
 	/// Create a new message call. Leave _myAddressOverride as the default to use the present address as caller.
-	virtual bool call(CallParameters& _params) override final;
+	/// @returns success flag and output data, if any.
+	virtual std::pair<bool, owning_bytes_ref> call(CallParameters& _params) override final;
 
 	/// Read address's balance.
 	virtual u256 balance(Address _a) override final { return m_s.balance(_a); }
 
-	/// Subtract amount from account's balance.
-	virtual void subBalance(u256 _a) override final { m_s.subBalance(myAddress, _a); }
-
-	/// Determine account's TX count.
-	virtual u256 txCount(Address _a) override final { return m_s.transactionsFrom(_a); }
-
 	/// Does the account exist?
-	virtual bool exists(Address _a) override final { return m_s.addressInUse(_a); }
+	virtual bool exists(Address _a) override final
+	{
+		if (evmSchedule().emptinessIsNonexistence())
+			return m_s.accountNonemptyAndExisting(_a);
+		else
+			return m_s.addressInUse(_a);
+	}
 
 	/// Suicide the associated contract to the given address.
-	virtual void suicide(Address _a) override final
-	{
-		m_s.addBalance(_a, m_s.balance(myAddress));
-		m_s.subBalance(myAddress, m_s.balance(myAddress));
-		ExtVMFace::suicide(_a);
-	}
-
-	/// Revert any changes made (by any of the other calls).
-	/// @TODO check call site for the parent manifest being discarded.
-	virtual void revert() override final
-	{
-		m_s.m_cache = m_origCache;
-		sub.clear();
-	}
+	virtual void suicide(Address _a) override final;
 
 	/// Return the EVM gas-price schedule for this execution context.
-	virtual EVMSchedule const& evmSchedule() const override final { return m_sealEngine->evmSchedule(envInfo()); }
+	virtual EVMSchedule const& evmSchedule() const override final { return m_sealEngine.evmSchedule(envInfo().number()); }
 
-	State& state() const { return m_s; }
+	State const& state() const { return m_s; }
+
+	/// Hash of a block if within the last 256 blocks, or h256() otherwise.
+	h256 blockHash(u256 _number) override;
 
 private:
-	State& m_s;											///< A reference to the base state.
-	std::unordered_map<Address, Account> m_origCache;	///< The cache of the address states (i.e. the externalities) as-was prior to the execution.
-	SealEngineFace* m_sealEngine;
+	State& m_s;  ///< A reference to the base state.
+	SealEngineFace const& m_sealEngine;
 };
 
 }
